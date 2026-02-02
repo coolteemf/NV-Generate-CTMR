@@ -6,7 +6,6 @@ import argparse
 import logging
 import os
 import random
-import ast
 from datetime import datetime
 
 import nibabel as nib
@@ -19,12 +18,13 @@ from monai.utils import set_determinism
 from tqdm import tqdm
 
 # Import utilities from the existing repo structure
+# Note: These require running as a module (python -m scripts.outpaint_inference)
 from .diff_model_setting import initialize_distributed, load_config, setup_logging
 from .sample import ReconModel
 from .utils import define_instance, dynamic_infer
 
 # -------------------------------------------------------------------------
-# Reuse Helper Functions from diff_model_infer.py
+# Reuse Helper Functions
 # -------------------------------------------------------------------------
 
 def set_random_seed(seed: int) -> int:
@@ -57,16 +57,22 @@ def load_models(args, device, logger):
 
 def prepare_tensors(args, device):
     """Prepares conditioning tensors (spacing, body regions) from config."""
-    top_region = np.array(args.diffusion_unet_inference["top_region_index"]).astype(float) * 1e2
-    bottom_region = np.array(args.diffusion_unet_inference["bottom_region_index"]).astype(float) * 1e2
-    spacing = np.array(args.diffusion_unet_inference["spacing"]).astype(float) * 1e2
+    # Robustly get the inference config dict (it should be patched in main)
+    if hasattr(args, "diffusion_unet_inference"):
+        infer_conf = args.diffusion_unet_inference
+    else:
+        infer_conf = vars(args)
+
+    top_region = np.array(infer_conf["top_region_index"]).astype(float) * 1e2
+    bottom_region = np.array(infer_conf["bottom_region_index"]).astype(float) * 1e2
+    spacing = np.array(infer_conf["spacing"]).astype(float) * 1e2
 
     top_tensor = torch.from_numpy(top_region[np.newaxis, :]).half().to(device)
     bot_tensor = torch.from_numpy(bottom_region[np.newaxis, :]).half().to(device)
     sp_tensor = torch.from_numpy(spacing[np.newaxis, :]).half().to(device)
     
     # Handle modality embedding if present
-    modality_val = args.diffusion_unet_inference.get("modality", 0)
+    modality_val = infer_conf.get("modality", 0)
     mod_tensor = modality_val * torch.ones((len(sp_tensor)), dtype=torch.long).to(device)
 
     return top_tensor, bot_tensor, sp_tensor, mod_tensor
@@ -102,6 +108,12 @@ def run_outpainting(
     """
     top_tensor, bot_tensor, spacing_tensor, modality_tensor = conditioning_tensors
     
+    # Get inference config safely
+    if hasattr(args, "diffusion_unet_inference"):
+        infer_conf = args.diffusion_unet_inference
+    else:
+        infer_conf = vars(args)
+
     # 1. Prepare Inputs
     # Calculate latent dimensions (Downsampled by 4)
     latent_shape = (1, args.latent_channels, output_size[0] // 4, output_size[1] // 4, output_size[2] // 4)
@@ -109,8 +121,6 @@ def run_outpainting(
 
     # 2. Encode the Known Crop
     # Normalize input [-1000, 1000] -> [0, 1] for VAE
-    # Note: Adjust this normalization if your VAE expects different ranges (e.g. -1, 1).
-    # Based on standard MAISI VAE usage:
     input_norm = (input_ct_crop + 1000.0) / 2000.0
     input_norm = torch.clamp(input_norm, 0.0, 1.0).to(device)
     
@@ -156,9 +166,11 @@ def run_outpainting(
 
     # 5. Setup Scheduler
     noise_scheduler = define_instance(args, "noise_scheduler")
+    num_steps = infer_conf.get("num_inference_steps", 30)
+
     if isinstance(noise_scheduler, RFlowScheduler):
         noise_scheduler.set_timesteps(
-            num_inference_steps=args.diffusion_unet_inference["num_inference_steps"],
+            num_inference_steps=num_steps,
             input_img_size_numel=torch.prod(torch.tensor(latent_shape[2:])),
         )
     else:
@@ -166,10 +178,9 @@ def run_outpainting(
 
     # 6. Inference Loop
     all_timesteps = noise_scheduler.timesteps
-    # Zip t and next_t (e.g., 1.0 -> 0.98 ...)
     timestep_pairs = zip(all_timesteps[:-1], all_timesteps[1:])
     
-    cfg_scale = args.diffusion_unet_inference.get("cfg_guidance_scale", 1.5)
+    cfg_scale = infer_conf.get("cfg_guidance_scale", 1.5)
     include_body = unet.include_top_region_index_input
     include_modality = unet.num_class_embeds is not None
 
@@ -241,8 +252,6 @@ def run_outpainting(
     
     # Post-process to HU
     data = synthetic_images.squeeze().cpu().detach().numpy()
-    # Normalize back to [-1000, 1000] (assuming decoder outputs [0,1])
-    # The 'save_image' logic in new repo usually does: (x - 0)/(1-0) * 2000 - 1000
     a_min, a_max = -1000, 1000
     data = data * (a_max - a_min) + a_min
     data = np.clip(data, a_min, a_max)
@@ -268,7 +277,13 @@ def main():
     
     # Load Configurations
     config = load_config(args.env_config, args.model_config, args.model_def)
-    # Merge argparse args into config args if needed, or use them directly
+
+    # Check if 'diffusion_unet_inference' exists. If not, assume the config is flat 
+    # and map 'diffusion_unet_inference' to the config object's internal dict.
+    if not hasattr(config, "diffusion_unet_inference"):
+        config.diffusion_unet_inference = vars(config)
+
+    # Merge argparse args into config args if needed
     config.output_dir = args.output_dir
     config.output_prefix = args.output_prefix
 
@@ -289,6 +304,7 @@ def main():
     logger.info(f"Loading input crop from {args.input_crop}...")
     nii_img = nib.load(args.input_crop)
     input_ct_crop = torch.from_numpy(nii_img.get_fdata()).float()
+    
     # Ensure shape (1, 1, D, H, W)
     if input_ct_crop.ndim == 3:
         input_ct_crop = input_ct_crop.unsqueeze(0).unsqueeze(0)
@@ -300,7 +316,8 @@ def main():
     crop_center = tuple(map(int, args.crop_center.split(',')))
     
     # Output Specs
-    output_size = tuple(config.diffusion_unet_inference["dim"])
+    output_size = tuple(config.diffusion_unet_inference["dim"]) if "dim" in config.diffusion_unet_inference else tuple(config.diffusion_unet_inference["output_size"])
+    
     output_spacing = tuple(config.diffusion_unet_inference["spacing"])
 
     # Run Outpainting
