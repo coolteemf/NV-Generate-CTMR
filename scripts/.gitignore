@@ -1,2 +1,3 @@
 *.lock
 *.nii.gz
+*.pyc
