@@ -57,15 +57,14 @@ def load_models(args, device, logger):
 
 def prepare_tensors(args, device):
     """Prepares conditioning tensors (spacing, body regions) from config."""
-    # Robustly get the inference config dict (it should be patched in main)
+    # Robustly get the inference config dict
     if hasattr(args, "diffusion_unet_inference"):
         infer_conf = args.diffusion_unet_inference
     else:
         infer_conf = vars(args)
 
     if "top_region_index" not in infer_conf and "body_region" in infer_conf:
-        # Map strings to region indices based on utils.py definitions: 
-        # 0=Head/Neck, 1=Thorax(Chest), 2=Abdomen, 3=Pelvis
+        # Map strings to region indices: 0=Head/Neck, 1=Thorax, 2=Abdomen, 3=Pelvis
         region_map = {"head": 0, "neck": 0, "chest": 1, "thorax": 1, "abdomen": 2, "pelvis": 3}
         
         # Find all mentioned regions
@@ -266,12 +265,19 @@ def run_outpainting(
     # 7. Decode
     logger.info("Decoding final volume...")
     recon_model = ReconModel(autoencoder=autoencoder, scale_factor=scale_factor).to(device)
+    
+    # Use config parameters for sliding window inference
+    sw_roi_size = infer_conf.get("autoencoder_sliding_window_infer_size")
+    sw_overlap = infer_conf.get("autoencoder_sliding_window_infer_overlap")
+    
+    print(f"sw_roi_size {sw_roi_size}")
+    print(f"sw_overlap {sw_overlap}")
     inferer = SlidingWindowInferer(
-        roi_size=[80, 80, 80],
+        roi_size=sw_roi_size,
         sw_batch_size=1,
         progress=True,
         mode="gaussian",
-        overlap=0.4,
+        overlap=sw_overlap,
         sw_device=device,
         device=device,
     )
