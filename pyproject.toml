@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "nv-generate-ctmr"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{include = "nv_generate_ctmr"}]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+monai-weekly = {extras = ["nibabel", "tqdm"], version = "^1.6.dev2605"}
+matplotlib = "^3.10.8"
+scikit-image = "^0.26.0"
+einops = "^0.8.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
