@@ -45,10 +45,10 @@ def load_models(args, device, logger):
 
     # Load UNet weights
     unet = define_instance(args, "diffusion_unet_def").to(device)
-    checkpoint = torch.load(f"{args.model_dir}/{args.model_filename}", map_location=device, weights_only=False)
+    checkpoint = torch.load(args.trained_diffusion_path, map_location=device, weights_only=False)
     unet.load_state_dict(checkpoint["unet_state_dict"], strict=False)
     unet.eval()
-    logger.info(f"Checkpoints {args.model_dir}/{args.model_filename} loaded.")
+    logger.info(f"Checkpoints {args.trained_diffusion_path} loaded.")
 
     # Load Scale Factor
     scale_factor = checkpoint.get("scale_factor", 1.0)
@@ -62,6 +62,36 @@ def prepare_tensors(args, device):
         infer_conf = args.diffusion_unet_inference
     else:
         infer_conf = vars(args)
+
+    if "top_region_index" not in infer_conf and "body_region" in infer_conf:
+        # Map strings to region indices based on utils.py definitions: 
+        # 0=Head/Neck, 1=Thorax(Chest), 2=Abdomen, 3=Pelvis
+        region_map = {"head": 0, "neck": 0, "chest": 1, "thorax": 1, "abdomen": 2, "pelvis": 3}
+        
+        # Find all mentioned regions
+        mentioned_indices = []
+        for br in infer_conf["body_region"]:
+            br_lower = br.lower()
+            for key, val in region_map.items():
+                if key in br_lower:
+                    mentioned_indices.append(val)
+        
+        # Default to Chest (1) if nothing recognized
+        if not mentioned_indices:
+            mentioned_indices = [1]
+            
+        min_idx = min(mentioned_indices)
+        max_idx = max(mentioned_indices)
+        
+        # Create one-hot vectors (size 4)
+        top_region_list = [0, 0, 0, 0]
+        top_region_list[min_idx] = 1
+        
+        bot_region_list = [0, 0, 0, 0]
+        bot_region_list[max_idx] = 1
+        
+        infer_conf["top_region_index"] = top_region_list
+        infer_conf["bottom_region_index"] = bot_region_list
 
     top_region = np.array(infer_conf["top_region_index"]).astype(float) * 1e2
     bottom_region = np.array(infer_conf["bottom_region_index"]).astype(float) * 1e2
@@ -281,7 +311,9 @@ def main():
     # Check if 'diffusion_unet_inference' exists. If not, assume the config is flat 
     # and map 'diffusion_unet_inference' to the config object's internal dict.
     if not hasattr(config, "diffusion_unet_inference"):
-        config.diffusion_unet_inference = vars(config)
+        # Use dict() to create a shallow copy of the vars dict to avoid 
+        # circular reference recursion during MONAI ConfigParser resolution.
+        config.diffusion_unet_inference = dict(vars(config))
 
     # Merge argparse args into config args if needed
     config.output_dir = args.output_dir
@@ -293,6 +325,14 @@ def main():
     
     seed = set_random_seed(config.diffusion_unet_inference.get("random_seed", 0) + local_rank)
     logger.info(f"Initialized Rank {local_rank}/{world_size} on {device} with seed {seed}")
+
+    if "autoencoder_tp_num_splits" in config.diffusion_unet_inference:
+        if hasattr(config, "autoencoder_def"):
+            config.autoencoder_def["num_splits"] = config.diffusion_unet_inference["autoencoder_tp_num_splits"]
+        if hasattr(config, "mask_generation_autoencoder_def"):
+            config.mask_generation_autoencoder_def["num_splits"] = config.diffusion_unet_inference["autoencoder_tp_num_splits"]
+    print(f"num tp splits autoencoder_def: {config.autoencoder_def['num_splits']}") 
+    print(f"num tp splits mask_generation_autoencoder_def: {config.mask_generation_autoencoder_def['num_splits']}")
 
     # Load Models
     autoencoder, unet, scale_factor = load_models(config, device, logger)
