@@ -1,3 +1,4 @@
 *.lock
 *.nii.gz
 *.pyc
+*.pt
