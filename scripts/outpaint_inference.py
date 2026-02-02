@@ -1,0 +1,331 @@
+# scripts/outpaint_inference.py
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import random
+import ast
+from datetime import datetime
+
+import nibabel as nib
+import numpy as np
+import torch
+import torch.distributed as dist
+from monai.inferers import SlidingWindowInferer
+from monai.networks.schedulers import RFlowScheduler
+from monai.utils import set_determinism
+from tqdm import tqdm
+
+# Import utilities from the existing repo structure
+from .diff_model_setting import initialize_distributed, load_config, setup_logging
+from .sample import ReconModel
+from .utils import define_instance, dynamic_infer
+
+# -------------------------------------------------------------------------
+# Reuse Helper Functions from diff_model_infer.py
+# -------------------------------------------------------------------------
+
+def set_random_seed(seed: int) -> int:
+    random_seed = random.randint(0, 99999) if seed is None else seed
+    set_determinism(random_seed)
+    return random_seed
+
+def load_models(args, device, logger):
+    """Loads Autoencoder, UNet, and Scale Factor using repo utilities."""
+    autoencoder = define_instance(args, "autoencoder_def").to(device)
+    # Load Autoencoder weights
+    checkpoint_autoencoder = torch.load(args.trained_autoencoder_path, map_location=device)
+    if "unet_state_dict" in checkpoint_autoencoder.keys():
+        checkpoint_autoencoder = checkpoint_autoencoder["unet_state_dict"]
+    autoencoder.load_state_dict(checkpoint_autoencoder)
+    autoencoder.eval()
+    logger.info(f"Checkpoints {args.trained_autoencoder_path} loaded.")
+
+    # Load UNet weights
+    unet = define_instance(args, "diffusion_unet_def").to(device)
+    checkpoint = torch.load(f"{args.model_dir}/{args.model_filename}", map_location=device, weights_only=False)
+    unet.load_state_dict(checkpoint["unet_state_dict"], strict=False)
+    unet.eval()
+    logger.info(f"Checkpoints {args.model_dir}/{args.model_filename} loaded.")
+
+    # Load Scale Factor
+    scale_factor = checkpoint.get("scale_factor", 1.0)
+    logger.info(f"Scale Factor -> {scale_factor}.")
+    return autoencoder, unet, scale_factor
+
+def prepare_tensors(args, device):
+    """Prepares conditioning tensors (spacing, body regions) from config."""
+    top_region = np.array(args.diffusion_unet_inference["top_region_index"]).astype(float) * 1e2
+    bottom_region = np.array(args.diffusion_unet_inference["bottom_region_index"]).astype(float) * 1e2
+    spacing = np.array(args.diffusion_unet_inference["spacing"]).astype(float) * 1e2
+
+    top_tensor = torch.from_numpy(top_region[np.newaxis, :]).half().to(device)
+    bot_tensor = torch.from_numpy(bottom_region[np.newaxis, :]).half().to(device)
+    sp_tensor = torch.from_numpy(spacing[np.newaxis, :]).half().to(device)
+    
+    # Handle modality embedding if present
+    modality_val = args.diffusion_unet_inference.get("modality", 0)
+    mod_tensor = modality_val * torch.ones((len(sp_tensor)), dtype=torch.long).to(device)
+
+    return top_tensor, bot_tensor, sp_tensor, mod_tensor
+
+def save_image(data, output_spacing, output_path, logger):
+    out_affine = np.eye(4)
+    for i in range(3):
+        out_affine[i, i] = output_spacing[i]
+
+    new_image = nib.Nifti1Image(data, affine=out_affine)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    nib.save(new_image, output_path)
+    logger.info(f"Saved {output_path}.")
+
+# -------------------------------------------------------------------------
+# Core Outpainting Logic
+# -------------------------------------------------------------------------
+
+def run_outpainting(
+    args,
+    device,
+    autoencoder,
+    unet,
+    scale_factor,
+    conditioning_tensors,
+    input_ct_crop,
+    crop_center,
+    output_size,
+    logger
+):
+    """
+    Executes the MAISI v2 Rectified Flow Outpainting loop.
+    """
+    top_tensor, bot_tensor, spacing_tensor, modality_tensor = conditioning_tensors
+    
+    # 1. Prepare Inputs
+    # Calculate latent dimensions (Downsampled by 4)
+    latent_shape = (1, args.latent_channels, output_size[0] // 4, output_size[1] // 4, output_size[2] // 4)
+    D, H, W = latent_shape[2:]
+
+    # 2. Encode the Known Crop
+    # Normalize input [-1000, 1000] -> [0, 1] for VAE
+    # Note: Adjust this normalization if your VAE expects different ranges (e.g. -1, 1).
+    # Based on standard MAISI VAE usage:
+    input_norm = (input_ct_crop + 1000.0) / 2000.0
+    input_norm = torch.clamp(input_norm, 0.0, 1.0).to(device)
+    
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", enabled=True):
+            # Encode and scale
+            z0_crop = autoencoder.encode_stage_2_inputs(input_norm) * scale_factor
+
+    # 3. Create Masks and Full Latent Canvas
+    mask = torch.ones(latent_shape, device=device) # 1 = Generate
+    z0_full = torch.zeros(latent_shape, device=device)
+
+    # Calculate latent coordinates for the crop
+    d_crop, h_crop, w_crop = z0_crop.shape[2:]
+    cz, cy, cx = [c // 4 for c in crop_center]
+    
+    # Calculate start/end indices with boundary checking
+    z_start = max(0, cz - d_crop // 2)
+    y_start = max(0, cy - h_crop // 2)
+    x_start = max(0, cx - w_crop // 2)
+    
+    z_end = min(D, z_start + d_crop)
+    y_end = min(H, y_start + h_crop)
+    x_end = min(W, x_start + w_crop)
+
+    # Place the crop into the full canvas and set mask to 0 (Keep)
+    # We must slice z0_crop in case it was clipped at boundaries
+    crop_z_len = z_end - z_start
+    crop_y_len = y_end - y_start
+    crop_x_len = x_end - x_start
+
+    z0_full[:, :, z_start:z_end, y_start:y_end, x_start:x_end] = \
+        z0_crop[:, :, :crop_z_len, :crop_y_len, :crop_x_len]
+    
+    mask[:, :, z_start:z_end, y_start:y_end, x_start:x_end] = 0.0
+    
+    logger.info(f"Outpainting Mask created. Locked region: [{z_start}:{z_end}, {y_start}:{y_end}, {x_start}:{x_end}] in latent space.")
+
+    # 4. Initialize Noise
+    # Ideally, we use the SAME noise map for the initial state and the trajectory of the known region
+    noise_canvas = torch.randn(latent_shape, device=device)
+    latents = noise_canvas.clone()
+
+    # 5. Setup Scheduler
+    noise_scheduler = define_instance(args, "noise_scheduler")
+    if isinstance(noise_scheduler, RFlowScheduler):
+        noise_scheduler.set_timesteps(
+            num_inference_steps=args.diffusion_unet_inference["num_inference_steps"],
+            input_img_size_numel=torch.prod(torch.tensor(latent_shape[2:])),
+        )
+    else:
+        raise ValueError("This outpainting script requires RFlowScheduler (MAISI v2).")
+
+    # 6. Inference Loop
+    all_timesteps = noise_scheduler.timesteps
+    # Zip t and next_t (e.g., 1.0 -> 0.98 ...)
+    timestep_pairs = zip(all_timesteps[:-1], all_timesteps[1:])
+    
+    cfg_scale = args.diffusion_unet_inference.get("cfg_guidance_scale", 1.5)
+    include_body = unet.include_top_region_index_input
+    include_modality = unet.num_class_embeds is not None
+
+    logger.info(f"Starting Rectified Flow Inference ({len(all_timesteps)} steps)...")
+    
+    with torch.amp.autocast("cuda", enabled=True):
+        for t, next_t in tqdm(timestep_pairs, total=len(all_timesteps)-1):
+            t_tensor = torch.Tensor([t]).to(device)
+
+            # A. Prepare UNet Inputs
+            unet_inputs = {
+                "x": latents,
+                "timesteps": t_tensor,
+                "spacing_tensor": spacing_tensor,
+            }
+            if include_body:
+                unet_inputs.update({
+                    "top_region_index_tensor": top_tensor,
+                    "bottom_region_index_tensor": bot_tensor,
+                })
+            if include_modality:
+                unet_inputs.update({"class_labels": modality_tensor})
+
+            # B. Classifier-Free Guidance
+            if cfg_scale > 0:
+                # Duplicate inputs
+                for k in unet_inputs.keys():
+                    if k == "class_labels":
+                        # Null token for unconditional
+                        unet_inputs[k] = torch.cat([unet_inputs[k], torch.zeros_like(modality_tensor)])
+                    else:
+                        unet_inputs[k] = torch.cat([unet_inputs[k]] * 2)
+
+                # Predict
+                out_both = unet(**unet_inputs)
+                out_cond, out_uncond = out_both.chunk(2)
+                v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
+            else:
+                v_pred = unet(**unet_inputs)
+
+            # C. Step (Euler step via Scheduler)
+            # RFlow: latents_next = latents + (next_t - t) * v_pred
+            latents_next, _ = noise_scheduler.step(v_pred, t, latents, next_t)
+
+            # D. Replacement (The Outpainting Magic)
+            # Calculate where the "known" heart should be at time `next_t`
+            # Trajectory: z_t = t * noise + (1-t) * data
+            z_known_next = next_t * noise_canvas + (1.0 - next_t) * z0_full
+            
+            # Combine: Keep generated (mask=1) parts, Force known (mask=0) parts
+            latents = latents_next * mask + z_known_next * (1.0 - mask)
+
+    # 7. Decode
+    logger.info("Decoding final volume...")
+    recon_model = ReconModel(autoencoder=autoencoder, scale_factor=scale_factor).to(device)
+    inferer = SlidingWindowInferer(
+        roi_size=[80, 80, 80],
+        sw_batch_size=1,
+        progress=True,
+        mode="gaussian",
+        overlap=0.4,
+        sw_device=device,
+        device=device,
+    )
+    
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", enabled=True):
+            synthetic_images = dynamic_infer(inferer, recon_model, latents)
+    
+    # Post-process to HU
+    data = synthetic_images.squeeze().cpu().detach().numpy()
+    # Normalize back to [-1000, 1000] (assuming decoder outputs [0,1])
+    # The 'save_image' logic in new repo usually does: (x - 0)/(1-0) * 2000 - 1000
+    a_min, a_max = -1000, 1000
+    data = data * (a_max - a_min) + a_min
+    data = np.clip(data, a_min, a_max)
+    
+    return np.int16(data)
+
+# -------------------------------------------------------------------------
+# Main Interface
+# -------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="MAISI v2 Outpainting Inference")
+    parser.add_argument("-e", "--env_config", type=str, required=True)
+    parser.add_argument("-c", "--model_config", type=str, required=True)
+    parser.add_argument("-t", "--model_def", type=str, required=True)
+    parser.add_argument("-i", "--input_crop", type=str, required=True, help="Path to NIfTI file of the crop (e.g. heart).")
+    parser.add_argument("--crop_center", type=str, required=True, help="Center (z,y,x) of the crop in the output canvas. E.g. '128,256,256'")
+    parser.add_argument("-g", "--num_gpus", type=int, default=1)
+    parser.add_argument("--output_dir", type=str, default="./output")
+    parser.add_argument("--output_prefix", type=str, default="outpaint_result")
+
+    args = parser.parse_args()
+    
+    # Load Configurations
+    config = load_config(args.env_config, args.model_config, args.model_def)
+    # Merge argparse args into config args if needed, or use them directly
+    config.output_dir = args.output_dir
+    config.output_prefix = args.output_prefix
+
+    # Initialize Distributed (or Single GPU)
+    local_rank, world_size, device = initialize_distributed(args.num_gpus)
+    logger = setup_logging("outpaint_inference")
+    
+    seed = set_random_seed(config.diffusion_unet_inference.get("random_seed", 0) + local_rank)
+    logger.info(f"Initialized Rank {local_rank}/{world_size} on {device} with seed {seed}")
+
+    # Load Models
+    autoencoder, unet, scale_factor = load_models(config, device, logger)
+    
+    # Prepare Tensors
+    cond_tensors = prepare_tensors(config, device)
+    
+    # Load Input Crop
+    logger.info(f"Loading input crop from {args.input_crop}...")
+    nii_img = nib.load(args.input_crop)
+    input_ct_crop = torch.from_numpy(nii_img.get_fdata()).float()
+    # Ensure shape (1, 1, D, H, W)
+    if input_ct_crop.ndim == 3:
+        input_ct_crop = input_ct_crop.unsqueeze(0).unsqueeze(0)
+    elif input_ct_crop.ndim == 4:
+        input_ct_crop = input_ct_crop.unsqueeze(0)
+    input_ct_crop = input_ct_crop.to(device)
+
+    # Parse Center
+    crop_center = tuple(map(int, args.crop_center.split(',')))
+    
+    # Output Specs
+    output_size = tuple(config.diffusion_unet_inference["dim"])
+    output_spacing = tuple(config.diffusion_unet_inference["spacing"])
+
+    # Run Outpainting
+    result_data = run_outpainting(
+        config,
+        device,
+        autoencoder,
+        unet,
+        scale_factor,
+        cond_tensors,
+        input_ct_crop,
+        crop_center,
+        output_size,
+        logger
+    )
+
+    # Save
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    out_name = f"{args.output_prefix}_{timestamp}.nii.gz"
+    out_path = os.path.join(args.output_dir, out_name)
+    
+    save_image(result_data, output_spacing, out_path, logger)
+    
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
