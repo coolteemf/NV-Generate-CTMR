@@ -12,13 +12,11 @@
                 "-e",
                 "configs/environment_rflow-ct.json",
                 "-c",
-                "configs/config_infer_24g_512x512x512.json",
+                "configs/config_infer_24g_512x512x128.json",
                 "-t",
                 "configs/config_network_rflow.json",
                 "-i",
                 "./heart_cropped.nii.gz",
-                "--crop_center",
-                "120,120,86"
             ],
             "env": {
                 "PYTHONPATH": "/home/francois/Projects/NV-Generate-CTMR",

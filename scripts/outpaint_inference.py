@@ -21,6 +21,7 @@ import random
 from datetime import datetime
 
 import nibabel as nib
+import nibabel.processing as nibproc
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -166,7 +167,7 @@ def run_outpainting(
     scale_factor,
     conditioning_tensors,
     input_ct_crop,
-    crop_center,
+    input_mask,
     output_size,
     logger,
 ):
@@ -200,39 +201,12 @@ def run_outpainting(
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=True):
             # Encode and scale
-            z0_crop = autoencoder.encode_stage_2_inputs(input_norm) * scale_factor
+            z0 = autoencoder.encode_stage_2_inputs(input_norm) * scale_factor
 
-    # 3. Create Masks and Full Latent Canvas
-    mask = torch.ones(latent_shape, device=device)  # 1 = Generate
-    z0_full = torch.zeros(latent_shape, device=device)
-
-    # Calculate latent coordinates for the crop
-    d_crop, h_crop, w_crop = z0_crop.shape[2:]
-    cz, cy, cx = [c // 4 for c in crop_center]
-
-    # Calculate start/end indices with boundary checking
-    z_start = max(0, cz - d_crop // 2)
-    y_start = max(0, cy - h_crop // 2)
-    x_start = max(0, cx - w_crop // 2)
-
-    z_end = min(D, z_start + d_crop)
-    y_end = min(H, y_start + h_crop)
-    x_end = min(W, x_start + w_crop)
-
-    # Place the crop into the full canvas and set mask to 0 (Keep)
-    # We must slice z0_crop in case it was clipped at boundaries
-    crop_z_len = z_end - z_start
-    crop_y_len = y_end - y_start
-    crop_x_len = x_end - x_start
-
-    z0_full[:, :, z_start:z_end, y_start:y_end, x_start:x_end] = z0_crop[
-        :, :, :crop_z_len, :crop_y_len, :crop_x_len
-    ]
-
-    mask[:, :, z_start:z_end, y_start:y_end, x_start:x_end] = 0.0
-
-    logger.info(
-        f"Outpainting Mask created. Locked region: [{z_start}:{z_end}, {y_start}:{y_end}, {x_start}:{x_end}] in latent space."
+    mask = torch.nn.functional.interpolate(
+        input_mask,
+        size=latent_shape[-3:], 
+        mode='nearest',
     )
 
     # 4. Initialize Noise
@@ -315,7 +289,7 @@ def run_outpainting(
             # D. Replacement (The Outpainting Magic)
             # Calculate where the "known" heart should be at time `next_t`
             # Trajectory: z_t = t * noise + (1-t) * data
-            z_known_next = next_t * noise_canvas + (1.0 - next_t) * z0_full
+            z_known_next = next_t * noise_canvas + (1.0 - next_t) * z0
 
             # Combine: Keep generated (mask=1) parts, Force known (mask=0) parts
             latents = latents_next * mask + z_known_next * (1.0 - mask)
@@ -372,12 +346,6 @@ def main():
         required=True,
         help="Path to NIfTI file of the crop (e.g. heart).",
     )
-    parser.add_argument(
-        "--crop_center",
-        type=str,
-        required=True,
-        help="Center (z,y,x) of the crop in the output canvas. E.g. '128,256,256'",
-    )
     parser.add_argument("-g", "--num_gpus", type=int, default=1)
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--output_prefix", type=str, default="outpaint_result")
@@ -432,9 +400,6 @@ def main():
     print(
         f"num tp splits mask_generation_autoencoder_def: {config.mask_generation_autoencoder_def['num_splits']}"
     )
-    # Parse Center
-    crop_center = tuple(map(int, args.crop_center.split(",")))
-
     # Output Specs
     output_size = (
         tuple(config.diffusion_unet_inference["dim"])
@@ -453,9 +418,9 @@ def main():
     # Load Input Crop
     logger.info(f"Loading input crop from {args.input_crop}...")
     nii_img = nib.load(args.input_crop)
-    min_image = nii_img.min()
+    min_image = nii_img.get_fdata().min()
     # Adapt to expected spacing
-    nii_img = nib.processing.resample_to_output(
+    nii_img = nibproc.resample_to_output(
         nii_img, voxel_sizes=output_spacing, order=3, mode="constant", cval=min_image
     )
     # Adapt to expected shape (padding)
@@ -476,13 +441,20 @@ def main():
     ] = nii_img.get_fdata()
     padded_img = nib.nifti1.Nifti1Image(padded_img_data, new_affine)
     input_ct_crop = torch.from_numpy(padded_img.get_fdata()).float()
+    # Generate mask with ones where outpainting happens
+    input_mask = np.ones(output_size)
+    input_mask[
+        inferior_padding[0] : inferior_padding[0] + nii_img.shape[0],
+        inferior_padding[1] : inferior_padding[1] + nii_img.shape[1],
+        inferior_padding[2] : inferior_padding[2] + nii_img.shape[2],
+    ] = 0
+    input_mask = torch.from_numpy(input_mask).float()
 
     # Ensure shape (1, 1, D, H, W)
-    if input_ct_crop.ndim == 3:
-        input_ct_crop = input_ct_crop.unsqueeze(0).unsqueeze(0)
-    elif input_ct_crop.ndim == 4:
-        input_ct_crop = input_ct_crop.unsqueeze(0)
+    input_mask = input_mask.unsqueeze(0).unsqueeze(0)
+    input_ct_crop = input_ct_crop.unsqueeze(0).unsqueeze(0)
     input_ct_crop = input_ct_crop.to(device)
+    input_mask = input_mask.to(device)
 
     # Run Outpainting
     result_data = run_outpainting(
@@ -493,7 +465,7 @@ def main():
         scale_factor,
         cond_tensors,
         input_ct_crop,
-        crop_center,
+        input_mask,
         output_size,
         logger,
     )
