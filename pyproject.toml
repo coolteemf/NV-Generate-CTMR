@@ -12,6 +12,7 @@ monai-weekly = {extras = ["nibabel", "tqdm"], version = "^1.6.dev2605"}
 matplotlib = "^3.10.8"
 scikit-image = "^0.26.0"
 einops = "^0.8.2"
+ipykernel = "^7.1.0"
 
 
 [build-system]
