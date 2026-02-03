@@ -229,6 +229,7 @@ def run_outpainting(
     # 6. Inference Loop
     all_timesteps = noise_scheduler.timesteps
     timestep_pairs = zip(all_timesteps[:-1], all_timesteps[1:])
+    max_timestep = all_timesteps[0]
 
     cfg_scale = infer_conf.get("cfg_guidance_scale", 1.5)
     include_body = unet.include_top_region_index_input
@@ -236,63 +237,65 @@ def run_outpainting(
 
     logger.info(f"Starting Rectified Flow Inference ({len(all_timesteps)} steps)...")
 
-    with torch.amp.autocast("cuda", enabled=True):
-        for t, next_t in tqdm(timestep_pairs, total=len(all_timesteps) - 1):
-            t_tensor = torch.Tensor([t]).to(device)
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", enabled=True):
+            for t, next_t in tqdm(timestep_pairs, total=len(all_timesteps) - 1):
+                t_tensor = torch.Tensor([t]).to(device)
 
-            # A. Prepare UNet Inputs
-            unet_inputs = {
-                "x": latents,
-                "timesteps": t_tensor,
-                "spacing_tensor": spacing_tensor,
-            }
-            if include_body:
-                unet_inputs.update(
-                    {
-                        "top_region_index_tensor": top_tensor,
-                        "bottom_region_index_tensor": bot_tensor,
-                    }
-                )
-            if include_modality:
-                unet_inputs.update({"class_labels": modality_tensor})
-
-            # B. Classifier-Free Guidance (Optimized for Memory)
-            if cfg_scale > 0:
-                # 1. Run Conditional Pass
-                # unet_inputs already contains the conditional data setup in step A
-                out_cond = unet(**unet_inputs)
-
-                # 2. Run Unconditional Pass
-                # Create a copy of inputs for the unconditional pass
-                unet_inputs_uncond = {k: v.clone() for k, v in unet_inputs.items()}
-
-                # Update class_labels to null (zeros) for unconditional
-                if "class_labels" in unet_inputs_uncond:
-                    unet_inputs_uncond["class_labels"] = torch.zeros_like(
-                        modality_tensor
+                # A. Prepare UNet Inputs
+                unet_inputs = {
+                    "x": latents,
+                    "timesteps": t_tensor,
+                    "spacing_tensor": spacing_tensor,
+                }
+                if include_body:
+                    unet_inputs.update(
+                        {
+                            "top_region_index_tensor": top_tensor,
+                            "bottom_region_index_tensor": bot_tensor,
+                        }
                     )
+                if include_modality:
+                    unet_inputs.update({"class_labels": modality_tensor})
 
-                out_uncond = unet(**unet_inputs_uncond)
+                # B. Classifier-Free Guidance (Optimized for Memory)
+                if cfg_scale > 0:
+                    # 1. Run Conditional Pass
+                    # unet_inputs already contains the conditional data setup in step A
+                    out_cond = unet(**unet_inputs)
 
-                # 3. Combine
-                v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
+                    # 2. Run Unconditional Pass
+                    # Create a copy of inputs for the unconditional pass
+                    unet_inputs_uncond = {k: v.clone() for k, v in unet_inputs.items()}
 
-                # Clean up to free memory immediately
-                del out_cond, out_uncond, unet_inputs_uncond
-            else:
-                v_pred = unet(**unet_inputs)
+                    # Update class_labels to null (zeros) for unconditional
+                    if "class_labels" in unet_inputs_uncond:
+                        unet_inputs_uncond["class_labels"] = torch.zeros_like(
+                            modality_tensor
+                        )
 
-            # C. Step (Euler step via Scheduler)
-            # RFlow: latents_next = latents + (next_t - t) * v_pred
-            latents_next, _ = noise_scheduler.step(v_pred, t, latents, next_t)
+                    out_uncond = unet(**unet_inputs_uncond)
 
-            # D. Replacement (The Outpainting Magic)
-            # Calculate where the "known" heart should be at time `next_t`
-            # Trajectory: z_t = t * noise + (1-t) * data
-            z_known_next = next_t * noise_canvas + (1.0 - next_t) * z0
+                    # 3. Combine
+                    v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
 
-            # Combine: Keep generated (mask=1) parts, Force known (mask=0) parts
-            latents = latents_next * mask + z_known_next * (1.0 - mask)
+                    # Clean up to free memory immediately
+                    del out_cond, out_uncond, unet_inputs_uncond
+                else:
+                    v_pred = unet(**unet_inputs)
+
+                # C. Step (Euler step via Scheduler)
+                # RFlow: latents_next = latents + (next_t - t) * v_pred
+                latents_next, _ = noise_scheduler.step(v_pred, t, latents, next_t)
+
+                # D. Replacement (The Outpainting Magic)
+                # Calculate where the "known" heart should be at time `next_t`
+                # Trajectory: z_t = t * noise + (1-t) * data
+                alpha = next_t / max_timestep
+                z_known_next = alpha * noise_canvas + (1.0 - alpha) * z0
+
+                # Combine: Keep generated (mask=1) parts, Force known (mask=0) parts
+                latents = latents_next * mask + z_known_next * (1.0 - mask)
 
     # 7. Decode
     logger.info("Decoding final volume...")
