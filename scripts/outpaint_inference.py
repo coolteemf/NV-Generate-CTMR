@@ -1,4 +1,15 @@
 # scripts/outpaint_inference.py
+# Optimized for volumes size:     "spacing": [
+    #     0.75,
+    #     0.75,
+    #     4.0
+    # ] *     "output_size": [
+    #     512,
+    #     512,
+    #     128
+    # ], = 384, 384, 412mm
+# Our volume size: 179.96, 179.96, 172 mm, resolution: 256x256x430, spacing: 0.703125, 0.703125, 0.400000mm
+# => resample to spacing, then pad
 
 from __future__ import annotations
 
@@ -340,6 +351,14 @@ def main():
     print(f"num tp splits autoencoder_def: {config.autoencoder_def['num_splits']}") 
     print(f"num tp splits mask_generation_autoencoder_def: {config.mask_generation_autoencoder_def['num_splits']}")
 
+    # Parse Center
+    crop_center = tuple(map(int, args.crop_center.split(',')))
+    
+    # Output Specs
+    output_size = tuple(config.diffusion_unet_inference["dim"]) if "dim" in config.diffusion_unet_inference else tuple(config.diffusion_unet_inference["output_size"])
+    
+    output_spacing = tuple(config.diffusion_unet_inference["spacing"])
+
     # Load Models
     autoencoder, unet, scale_factor = load_models(config, device, logger)
     
@@ -349,7 +368,30 @@ def main():
     # Load Input Crop
     logger.info(f"Loading input crop from {args.input_crop}...")
     nii_img = nib.load(args.input_crop)
-    input_ct_crop = torch.from_numpy(nii_img.get_fdata()).float()
+    min_image = nii_img.min()
+    # Adapt to expected spacing
+    nii_img = nib.processing.resample_to_output(nii_img,
+                                      voxel_sizes=output_spacing, 
+                                      order=3, 
+                                      mode='constant', 
+                                      cval=min_image)
+    # Adapt to expected shape (padding)
+    pad_amount = np.array(output_size) - np.array(nii_img.shape)
+    inferior_padding = pad_amount // 2 # //2 or /2 to keep original aligned ?
+    superior_padding = pad_amount - inferior_padding
+    assert np.all(pad_amount > 0)
+    origin_delta = nii_img.affine[:3, :3] @ inferior_padding 
+    new_origin = nii_img.affine[:3, 3] - origin_delta
+    new_affine = np.eye(4)
+    new_affine[:3, :3] = nii_img.affine[:3, :3]
+    new_affine[:3, 3] = new_origin
+    padded_img_data = np.zeros(output_size) + min_image
+    padded_img_data[inferior_padding[0]:inferior_padding[0]+nii_img.shape[0],
+                    inferior_padding[1]:inferior_padding[1]+nii_img.shape[1],
+                    inferior_padding[2]:inferior_padding[2]+nii_img.shape[2]] = nii_img.get_fdata()
+    padded_img = nib.nifti1.Nifti1Image(padded_img_data,
+                                        new_affine)
+    input_ct_crop = torch.from_numpy(padded_img.get_fdata()).float()
     
     # Ensure shape (1, 1, D, H, W)
     if input_ct_crop.ndim == 3:
@@ -358,13 +400,6 @@ def main():
         input_ct_crop = input_ct_crop.unsqueeze(0)
     input_ct_crop = input_ct_crop.to(device)
 
-    # Parse Center
-    crop_center = tuple(map(int, args.crop_center.split(',')))
-    
-    # Output Specs
-    output_size = tuple(config.diffusion_unet_inference["dim"]) if "dim" in config.diffusion_unet_inference else tuple(config.diffusion_unet_inference["output_size"])
-    
-    output_spacing = tuple(config.diffusion_unet_inference["spacing"])
 
     # Run Outpainting
     result_data = run_outpainting(
