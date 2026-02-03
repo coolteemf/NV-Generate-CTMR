@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Outpaint Inference",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "scripts.outpaint_inference",
+            "cwd": "/home/francois/Projects/NV-Generate-CTMR",
+            "console": "integratedTerminal",
+            "args": [
+                "-e",
+                "configs/environment_rflow-ct.json",
+                "-c",
+                "configs/config_infer_24g_512x512x512.json",
+                "-t",
+                "configs/config_network_rflow.json",
+                "-i",
+                "./heart_cropped.nii.gz",
+                "--crop_center",
+                "120,120,86"
+            ],
+            "env": {
+                "PYTHONPATH": "/home/francois/Projects/NV-Generate-CTMR",
+                "PYTORCH_ALLOC_CONF": "expandable_segments:True"
+            }
+        }
+    ]
+}
