@@ -4,7 +4,7 @@ set -e
 # --- 1. System Dependencies (Ephemeral - Must run every start) ---
 # apt packages reside in system folders, so they reset on restart.
 export DEBIAN_FRONTEND=noninteractive
-apt-get update && apt-get install -y git curl
+apt-get update && apt-get install -y git curl rsync
 
 # --- 2. Install Poetry (Ephemeral Binary, Persistent Config) ---
 # We reinstall the binary to ensuring it's in the current container's PATH/libs
