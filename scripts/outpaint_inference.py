@@ -3,7 +3,7 @@
 #     0.75,
 #     0.75,
 #     4.0
-# ] *     "output_size": [
+# ] * "output_size": [
 #     512,
 #     512,
 #     128
@@ -44,6 +44,7 @@ from .utils import define_instance, dynamic_infer
 # -------------------------------------------------------------------------
 # Reuse Helper Functions
 # -------------------------------------------------------------------------
+
 
 def get_volume_bb(img, min_val):
     mask = img > min_val
@@ -86,7 +87,8 @@ def load_models(args, device, logger):
     # Load UNet weights
     unet = define_instance(args, "diffusion_unet_def").to(device)
     checkpoint = torch.load(
-        "/home/francois/Projects/NV-Generate-CTMR/models/diff_unet_3d_rflow-ct.pt",
+        # "/home/francois/Projects/NV-Generate-CTMR/models/diff_unet_3d_ddpm-ct.pt",
+        args.trained_diffusion_path,
         map_location=device,
         weights_only=False,
     )
@@ -173,8 +175,56 @@ def save_image(data, output_spacing, output_path, logger):
 
 
 # -------------------------------------------------------------------------
-# Core Outpainting Logic
+# Core Outpainting Logic (RePaint Enhanced)
 # -------------------------------------------------------------------------
+
+
+def get_repaint_schedule(timesteps, jump_len=10, jump_n_sample=10):
+    """
+    Generates a RePaint resampling schedule.
+    [cite_start]Reference: RePaint Paper [cite: 504-515].
+
+    Args:
+        timesteps (Tensor): Monotonically decreasing list of timesteps.
+        jump_len (int): Number of steps to jump back (j).
+        jump_n_sample (int): Number of times to resample (r).
+
+    Returns:
+        List[float]: The full execution schedule of timesteps including jumps.
+    """
+    ts_list = timesteps.cpu().tolist()
+    final_indices = []
+
+    # We start at index 0 (High Noise / Time T)
+    curr_idx = 0
+    final_indices.append(curr_idx)
+
+    # Iterate until we reach the last step (Data / Time 0)
+    # Note: ts_list indices [0, 1, ... N-1] correspond to steps [T, ..., 0]
+    while curr_idx < len(ts_list) - 1:
+        # 1. Standard Denoise Step (Forward in index, Backward in time)
+        curr_idx += 1
+        final_indices.append(curr_idx)
+
+        # 2. Resampling Check
+        # If we have completed a block of 'jump_len' steps, we resample.
+        # We check (curr_idx % jump_len == 0) to align with blocks of size j.
+        if curr_idx % jump_len == 0:
+            # Repeat the process (r-1) times, because we just performed the 1st pass
+            for _ in range(jump_n_sample - 1):
+                # A. Diffuse: Jump back 'j' steps (Backward in index, Forward in time)
+                for _ in range(jump_len):
+                    curr_idx -= 1
+                    final_indices.append(curr_idx)
+
+                # B. Denoise: Walk forward 'j' steps again
+                for _ in range(jump_len):
+                    curr_idx += 1
+                    final_indices.append(curr_idx)
+
+    # Map indices back to actual timestep values
+    schedule_ts = [ts_list[i] for i in final_indices]
+    return schedule_ts
 
 
 def run_outpainting(
@@ -190,18 +240,16 @@ def run_outpainting(
     logger,
 ):
     """
-    Executes the MAISI v2 Rectified Flow Outpainting loop.
+    Executes the MAISI v2 Rectified Flow Outpainting loop with RePaint support.
     """
     top_tensor, bot_tensor, spacing_tensor, modality_tensor = conditioning_tensors
 
-    # Get inference config safely
     if hasattr(args, "diffusion_unet_inference"):
         infer_conf = args.diffusion_unet_inference
     else:
         infer_conf = vars(args)
 
     # 1. Prepare Inputs
-    # Calculate latent dimensions (Downsampled by 4)
     latent_shape = (
         1,
         args.latent_channels,
@@ -209,26 +257,22 @@ def run_outpainting(
         output_size[1] // 4,
         output_size[2] // 4,
     )
-    D, H, W = latent_shape[2:]
 
     # 2. Encode the Known Crop
-    # Normalize input [-1000, 1000] -> [0, 1] for VAE
     input_norm = (input_ct_crop + 1000.0) / 2000.0
     input_norm = torch.clamp(input_norm, 0.0, 1.0).to(device)
 
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=True):
-            # Encode and scale
             z0 = autoencoder.encode_stage_2_inputs(input_norm) * scale_factor
 
     mask = torch.nn.functional.interpolate(
         input_mask,
-        size=latent_shape[-3:], 
-        mode='nearest',
+        size=latent_shape[-3:],
+        mode="nearest",
     )
 
     # 4. Initialize Noise
-    # Ideally, we use the SAME noise map for the initial state and the trajectory of the known region
     noise_canvas = torch.randn(latent_shape, device=device)
     latents = noise_canvas.clone()
 
@@ -244,21 +288,46 @@ def run_outpainting(
     else:
         raise ValueError("This outpainting script requires RFlowScheduler (MAISI v2).")
 
-    # 6. Inference Loop
-    all_timesteps = noise_scheduler.timesteps
-    timestep_pairs = zip(all_timesteps[:-1], all_timesteps[1:])
-    max_timestep = all_timesteps[0]
+    # 6. RePaint Schedule Generation
+    # Get standard decreasing timesteps
+    standard_timesteps = noise_scheduler.timesteps  # e.g. [999, ..., 0]
 
-    cfg_scale = infer_conf.get("cfg_guidance_scale", 0.)
+    # Get RePaint parameters (defaults to 1 = no resampling if not specified)
+    jump_len = infer_conf.get("jump_length", 1)
+    jump_n_sample = infer_conf.get("jump_n_sample", 1)
+
+    if jump_len > 1 and jump_n_sample > 1:
+        logger.info(
+            f"RePaint Strategy Enabled: Jump Length={jump_len}, Resamples={jump_n_sample}"
+        )
+        repaint_timesteps = get_repaint_schedule(
+            standard_timesteps, jump_len, jump_n_sample
+        )
+    else:
+        repaint_timesteps = standard_timesteps.tolist()
+
+    # Create pairs (current, next)
+    # Note: repaint_timesteps contains the sequence of 't'.
+    # The loop runs transitions.
+    timestep_pairs = zip(repaint_timesteps[:-1], repaint_timesteps[1:])
+    max_timestep = standard_timesteps[0]  # Used for alpha calculation
+
+    cfg_scale = infer_conf.get("cfg_guidance_scale", 0.0)
     include_body = unet.include_top_region_index_input
     include_modality = unet.num_class_embeds is not None
 
-    logger.info(f"Starting Rectified Flow Inference ({len(all_timesteps)} steps)...")
+    logger.info(f"Starting Inference with {len(repaint_timesteps) - 1} transitions...")
 
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=True):
-            for t, next_t in tqdm(timestep_pairs, total=len(all_timesteps) - 1):
-                t_tensor = torch.Tensor([t]).to(device)
+            for t_val, next_t_val in tqdm(
+                timestep_pairs, total=len(repaint_timesteps) - 1
+            ):
+                # Convert to tensor for model input
+                t_tensor = torch.Tensor([t_val]).to(device)
+
+                # Detect Direction
+                is_denoising = next_t_val < t_val
 
                 # A. Prepare UNet Inputs
                 unet_inputs = {
@@ -276,44 +345,52 @@ def run_outpainting(
                 if include_modality:
                     unet_inputs.update({"class_labels": modality_tensor})
 
-                # B. Classifier-Free Guidance (Optimized for Memory)
+                # B. Predict Velocity
                 if cfg_scale > 0:
-                    # 1. Run Conditional Pass
-                    # unet_inputs already contains the conditional data setup in step A
                     out_cond = unet(**unet_inputs)
-
-                    # 2. Run Unconditional Pass
-                    # Create a copy of inputs for the unconditional pass
                     unet_inputs_uncond = {k: v.clone() for k, v in unet_inputs.items()}
-
-                    # Update class_labels to null (zeros) for unconditional
                     if "class_labels" in unet_inputs_uncond:
                         unet_inputs_uncond["class_labels"] = torch.zeros_like(
                             modality_tensor
                         )
-
                     out_uncond = unet(**unet_inputs_uncond)
-
-                    # 3. Combine
                     v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
-
-                    # Clean up to free memory immediately
                     del out_cond, out_uncond, unet_inputs_uncond
                 else:
                     v_pred = unet(**unet_inputs)
 
-                # C. Step (Euler step via Scheduler)
-                # RFlow: latents_next = latents + (next_t - t) * v_pred
-                latents_next, _ = noise_scheduler.step(v_pred, t, latents, next_t)
+                # C. Step (Bidirectional)
+                # noise_scheduler.step handles both forward (dt > 0) and backward (dt < 0)
+                # based on the passed timesteps.
+                # RFlow: latents_next = latents + v_pred * (next_t - t) / T
+                latents, _ = noise_scheduler.step(v_pred, t_val, latents, next_t_val)
 
-                # D. Replacement (The Outpainting Magic)
-                # Calculate where the "known" heart should be at time `next_t`
-                # Trajectory: z_t = t * noise + (1-t) * data
-                alpha = next_t / max_timestep
+                # D. Force Known Region (Harmonization)
+                # We enforce the known region conditions.
+                # RePaint suggests doing this during the reverse (denoise) steps
+                # to correct the generated content[cite: 160].
+
+                # Calculate the analytical state of the 'known' region at 'next_t_val'
+                alpha = next_t_val / max_timestep
                 z_known_next = alpha * noise_canvas + (1.0 - alpha) * z0
 
-                # Combine: Keep generated (mask=1) parts, Force known (mask=0) parts
-                latents = latents_next * mask + z_known_next * (1.0 - mask)
+                # Apply mask: Keep generated (mask=1) parts, Force known (mask=0) parts
+                # We apply this primarily when Denoising (moving towards data).
+                # When Diffusing (moving towards noise), we allow the regions to mix
+                # so the subsequent Denoise step can harmonize the boundary.
+
+                if is_denoising:
+                    latents = latents * mask + z_known_next * (1.0 - mask)
+                else:
+                    # When diffusing back (adding noise), we can also enforce the known region's
+                    # noisy state to ensure we don't drift too far, or we can let it float.
+                    # RePaint paper Eq 9 implies we diffuse the *combined* image.
+                    # The previous iteration (denoise) ended with a combined image.
+                    # So 'latents' input to this step was already combined.
+                    # We just output the diffused version.
+                    # However, ensuring the known region is strictly correct at the target noise level
+                    # helps stability.
+                    latents = latents * mask + z_known_next * (1.0 - mask)
 
     # 7. Decode
     logger.info("Decoding final volume...")
@@ -321,12 +398,9 @@ def run_outpainting(
         device
     )
 
-    # Use config parameters for sliding window inference
     sw_roi_size = infer_conf.get("autoencoder_sliding_window_infer_size")
     sw_overlap = infer_conf.get("autoencoder_sliding_window_infer_overlap")
 
-    print(f"sw_roi_size {sw_roi_size}")
-    print(f"sw_overlap {sw_overlap}")
     inferer = SlidingWindowInferer(
         roi_size=sw_roi_size,
         sw_batch_size=1,
@@ -341,7 +415,6 @@ def run_outpainting(
         with torch.amp.autocast("cuda", enabled=True):
             synthetic_images = dynamic_infer(inferer, recon_model, latents)
 
-    # Post-process to HU
     data = synthetic_images.squeeze().cpu().detach().numpy()
     a_min, a_max = -1000, 1000
     data = data * (a_max - a_min) + a_min
@@ -386,18 +459,12 @@ def main():
     # Load Configurations
     config = load_config(args.env_config, args.model_config, args.model_def)
 
-    # Check if 'diffusion_unet_inference' exists. If not, assume the config is flat
-    # and map 'diffusion_unet_inference' to the config object's internal dict.
     if not hasattr(config, "diffusion_unet_inference"):
-        # Use dict() to create a shallow copy of the vars dict to avoid
-        # circular reference recursion during MONAI ConfigParser resolution.
         config.diffusion_unet_inference = dict(vars(config))
 
-    # Merge argparse args into config args if needed
     config.output_dir = args.output_dir
     config.output_prefix = args.output_prefix
 
-    # Initialize Distributed (or Single GPU)
     local_rank, world_size, device = initialize_distributed(args.num_gpus)
     logger = setup_logging("outpaint_inference")
 
@@ -417,59 +484,35 @@ def main():
             config.mask_generation_autoencoder_def["num_splits"] = (
                 config.diffusion_unet_inference["autoencoder_tp_num_splits"]
             )
-    print(f"num tp splits autoencoder_def: {config.autoencoder_def['num_splits']}")
-    print(
-        f"num tp splits mask_generation_autoencoder_def: {config.mask_generation_autoencoder_def['num_splits']}"
-    )
-    # Output Specs
+
     output_size = (
         tuple(config.diffusion_unet_inference["dim"])
         if "dim" in config.diffusion_unet_inference
         else tuple(config.diffusion_unet_inference["output_size"])
     )
 
-    # Load Models
     autoencoder, unet, scale_factor = load_models(config, device, logger)
-
-    # Prepare Tensors
     cond_tensors = prepare_tensors(config, device)
 
-    # Load Input Crop
     logger.info(f"Loading input crop from {args.input_crop}...")
     nii_img = nib.load(args.input_crop)
     min_image = nii_img.get_fdata().min()
 
-    # Target shape from config
     target_shape = np.array(config.diffusion_unet_inference["output_size"])
-
-    # Calculate Zoom Factors: (Current Shape) / (Target Shape)
-    # This determines how many input voxels fit into one output voxel
     zoom_factors = np.array(nii_img.shape) / target_shape
-
-    # Construct New Affine
-    # A_new = A_old @ ScaleMatrix
-    # This scales the voxel sizes to fit the new shape while preserving physical FOV
     new_affine = nii_img.affine @ np.diag(list(zoom_factors) + [1])
 
     logger.info(f"Resampling from {nii_img.shape} to fixed shape {target_shape}")
 
-    # Use resample_from_to allows passing (shape, affine) as the target
     nii_img = nibproc.resample_from_to(
         nii_img, (target_shape, new_affine), order=3, mode="constant", cval=min_image
     )
 
-    # Save the actual new spacing
     output_spacing = tuple(nib.affines.voxel_sizes(new_affine))
 
-    print(f"Final shape: {nii_img.shape}")
-    print(f"Final spacing: {output_spacing}")
-    # Adapt to expected shape (padding)
     pad_amount = np.array(output_size) - np.array(nii_img.shape)
-    origin = nii_img.affine[:3, 3]
-    # 0,0,0 origin was at -236, -45.54, -61.0
     inferior_padding = pad_amount // 2
-    superior_padding = pad_amount - inferior_padding
-    assert np.all(pad_amount >= 0)
+
     origin_delta = nii_img.affine[:3, :3] @ inferior_padding
     new_origin = nii_img.affine[:3, 3] - origin_delta
     new_affine = np.eye(4)
@@ -483,7 +526,7 @@ def main():
     ] = nii_img.get_fdata()
     padded_img = nib.nifti1.Nifti1Image(padded_img_data, new_affine)
     input_ct_crop = torch.from_numpy(padded_img.get_fdata()).float()
-    # Generate mask with 1 where outpainting happens
+
     data_bb = get_volume_bb(padded_img_data, -1000)
     input_mask = np.ones(output_size)
     input_mask[
@@ -493,13 +536,11 @@ def main():
     ] = 0
     input_mask = torch.from_numpy(input_mask).float()
 
-    # Ensure shape (1, 1, D, H, W)
     input_mask = input_mask.unsqueeze(0).unsqueeze(0)
     input_ct_crop = input_ct_crop.unsqueeze(0).unsqueeze(0)
     input_ct_crop = input_ct_crop.to(device)
     input_mask = input_mask.to(device)
 
-    # Run Outpainting
     result_data = run_outpainting(
         config,
         device,
@@ -513,7 +554,6 @@ def main():
         logger,
     )
 
-    # Save
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     out_name = f"{args.output_prefix}_{timestamp}.nii.gz"
     out_path = os.path.join(args.output_dir, out_name)
