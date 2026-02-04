@@ -45,6 +45,24 @@ from .utils import define_instance, dynamic_infer
 # Reuse Helper Functions
 # -------------------------------------------------------------------------
 
+def get_volume_bb(img, min_val):
+    mask = img > min_val
+
+    def get_bbox_limits(mask, axis):
+        # Collapse other axes
+        reduce_axes = tuple(i for i in range(mask.ndim) if i != axis)
+        valid_indices = np.where(np.any(mask, axis=reduce_axes))[0]
+        if valid_indices.size > 0:
+            return valid_indices[0], valid_indices[-1]
+        return 0, 0
+
+    if np.any(mask):
+        x_start, x_end = get_bbox_limits(mask, 0)
+        y_start, y_end = get_bbox_limits(mask, 1)
+        z_start, z_end = get_bbox_limits(mask, 2)
+
+    return x_start, x_end, y_start, y_end, z_start, z_end
+
 
 def set_random_seed(seed: int) -> int:
     random_seed = random.randint(0, 99999) if seed is None else seed
@@ -231,7 +249,7 @@ def run_outpainting(
     timestep_pairs = zip(all_timesteps[:-1], all_timesteps[1:])
     max_timestep = all_timesteps[0]
 
-    cfg_scale = infer_conf.get("cfg_guidance_scale", 1.5)
+    cfg_scale = infer_conf.get("cfg_guidance_scale", 0.)
     include_body = unet.include_top_region_index_input
     include_modality = unet.num_class_embeds is not None
 
@@ -410,8 +428,6 @@ def main():
         else tuple(config.diffusion_unet_inference["output_size"])
     )
 
-    output_spacing = tuple(config.diffusion_unet_inference["spacing"])
-
     # Load Models
     autoencoder, unet, scale_factor = load_models(config, device, logger)
 
@@ -422,15 +438,38 @@ def main():
     logger.info(f"Loading input crop from {args.input_crop}...")
     nii_img = nib.load(args.input_crop)
     min_image = nii_img.get_fdata().min()
-    # Adapt to expected spacing
-    nii_img = nibproc.resample_to_output(
-        nii_img, voxel_sizes=output_spacing, order=3, mode="constant", cval=min_image
+
+    # Target shape from config
+    target_shape = np.array(config.diffusion_unet_inference["output_size"])
+
+    # Calculate Zoom Factors: (Current Shape) / (Target Shape)
+    # This determines how many input voxels fit into one output voxel
+    zoom_factors = np.array(nii_img.shape) / target_shape
+
+    # Construct New Affine
+    # A_new = A_old @ ScaleMatrix
+    # This scales the voxel sizes to fit the new shape while preserving physical FOV
+    new_affine = nii_img.affine @ np.diag(list(zoom_factors) + [1])
+
+    logger.info(f"Resampling from {nii_img.shape} to fixed shape {target_shape}")
+
+    # Use resample_from_to allows passing (shape, affine) as the target
+    nii_img = nibproc.resample_from_to(
+        nii_img, (target_shape, new_affine), order=3, mode="constant", cval=min_image
     )
+
+    # Save the actual new spacing
+    output_spacing = tuple(nib.affines.voxel_sizes(new_affine))
+
+    print(f"Final shape: {nii_img.shape}")
+    print(f"Final spacing: {output_spacing}")
     # Adapt to expected shape (padding)
     pad_amount = np.array(output_size) - np.array(nii_img.shape)
-    inferior_padding = pad_amount // 2  # //2 or /2 to keep original aligned ?
+    origin = nii_img.affine[:3, 3]
+    # 0,0,0 origin was at -236, -45.54, -61.0
+    inferior_padding = pad_amount // 2
     superior_padding = pad_amount - inferior_padding
-    assert np.all(pad_amount > 0)
+    assert np.all(pad_amount >= 0)
     origin_delta = nii_img.affine[:3, :3] @ inferior_padding
     new_origin = nii_img.affine[:3, 3] - origin_delta
     new_affine = np.eye(4)
@@ -444,12 +483,13 @@ def main():
     ] = nii_img.get_fdata()
     padded_img = nib.nifti1.Nifti1Image(padded_img_data, new_affine)
     input_ct_crop = torch.from_numpy(padded_img.get_fdata()).float()
-    # Generate mask with ones where outpainting happens
+    # Generate mask with 1 where outpainting happens
+    data_bb = get_volume_bb(padded_img_data, -1000)
     input_mask = np.ones(output_size)
     input_mask[
-        inferior_padding[0] : inferior_padding[0] + nii_img.shape[0],
-        inferior_padding[1] : inferior_padding[1] + nii_img.shape[1],
-        inferior_padding[2] : inferior_padding[2] + nii_img.shape[2],
+        data_bb[0] : data_bb[1],
+        data_bb[2] : data_bb[3],
+        data_bb[4] : data_bb[5],
     ] = 0
     input_mask = torch.from_numpy(input_mask).float()
 

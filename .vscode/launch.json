@@ -12,16 +12,17 @@
                 "-e",
                 "configs/environment_rflow-ct.json",
                 "-c",
-                "configs/config_infer_24g_512x512x128.json",
+                "configs/config_infer_16g_256x256x128.json",
                 "-t",
                 "configs/config_network_rflow.json",
                 "-i",
-                "./heart_cropped.nii.gz",
+                "./heart_aligned.nii.gz",
             ],
             "env": {
                 "PYTHONPATH": "/home/francois/Projects/NV-Generate-CTMR",
                 "PYTORCH_ALLOC_CONF": "expandable_segments:True"
-            }
+            },
+            "justMyCode": false
         }
     ]
 }
