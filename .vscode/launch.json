@@ -10,11 +10,11 @@
             "console": "integratedTerminal",
             "args": [
                 "-e",
-                "configs/environment_rflow-ct.json",
+                "configs/environment_ddpm-ct.json",
                 "-c",
                 "configs/config_infer_16g_256x256x128.json",
                 "-t",
-                "configs/config_network_rflow.json",
+                "configs/config_network_ddpm.json",
                 "-i",
                 "./heart_aligned.nii.gz",
             ],

@@ -286,7 +286,9 @@ def run_outpainting(
             input_img_size_numel=torch.prod(torch.tensor(latent_shape[2:])),
         )
     else:
-        raise ValueError("This outpainting script requires RFlowScheduler (MAISI v2).")
+        noise_scheduler.set_timesteps(
+            num_inference_steps=args.diffusion_unet_inference["num_inference_steps"]
+        )
 
     # 6. RePaint Schedule Generation
     # Get standard decreasing timesteps
@@ -363,7 +365,12 @@ def run_outpainting(
                 # noise_scheduler.step handles both forward (dt > 0) and backward (dt < 0)
                 # based on the passed timesteps.
                 # RFlow: latents_next = latents + v_pred * (next_t - t) / T
-                latents, _ = noise_scheduler.step(v_pred, t_val, latents, next_t_val)
+                if not isinstance(noise_scheduler, RFlowScheduler):
+                    latents, _ = noise_scheduler.step(v_pred, t_val, latents)  # type: ignore
+                else:
+                    latents, _ = noise_scheduler.step(
+                        v_pred, t_val, latents, next_t_val
+                    )  # type: ignore
 
                 # D. Force Known Region (Harmonization)
                 # We enforce the known region conditions.
@@ -382,15 +389,7 @@ def run_outpainting(
                 if is_denoising:
                     latents = latents * mask + z_known_next * (1.0 - mask)
                 else:
-                    # When diffusing back (adding noise), we can also enforce the known region's
-                    # noisy state to ensure we don't drift too far, or we can let it float.
-                    # RePaint paper Eq 9 implies we diffuse the *combined* image.
-                    # The previous iteration (denoise) ended with a combined image.
-                    # So 'latents' input to this step was already combined.
-                    # We just output the diffused version.
-                    # However, ensuring the known region is strictly correct at the target noise level
-                    # helps stability.
-                    latents = latents * mask + z_known_next * (1.0 - mask)
+                    pass
 
     # 7. Decode
     logger.info("Decoding final volume...")
