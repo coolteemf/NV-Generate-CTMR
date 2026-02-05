@@ -731,3 +731,76 @@ def dynamic_infer(inferer, model, images):
         output = inferer(network=model, inputs=images)
         inferer.roi_size = orig_roi
         return output
+
+
+def save_debug_state(local_vars, filename="debug_state.npz", verbose=True):
+    """
+    Exports local variables to a .npz file for debugging.
+    Recursively converts Tensors inside dicts/lists to Numpy.
+    Ignores non-serializable objects (modules, functions).
+    """
+
+    def clean_data(data):
+        """Recursively converts tensors to numpy and handles containers."""
+        # 1. Handle Torch Tensors (Move to CPU, detach, float, numpy)
+        if isinstance(data, torch.Tensor):
+            return data.detach().float().cpu().numpy()
+
+        # 2. Handle Numpy Arrays (pass through)
+        elif isinstance(data, np.ndarray):
+            return data
+
+        # 3. Handle Dictionaries (Recursive)
+        elif isinstance(data, dict):
+            return {k: clean_data(v) for k, v in data.items()}
+
+        # 4. Handle Lists/Tuples (Recursive)
+        elif isinstance(data, (list, tuple)):
+            # Convert tuples to lists for easier serialization/reloading
+            return [clean_data(v) for v in data]
+
+        # 5. Handle Primitives (pass through)
+        elif isinstance(data, (int, float, str, bool, type(None))):
+            return data
+
+        # 6. Handle Objects with __dict__ (args, configs)
+        elif hasattr(data, "__dict__"):
+            # Stop recursion here to avoid deep object graphs; just dump the attributes
+            # We filter out methods/private vars inside the object if needed
+            try:
+                return {
+                    k: clean_data(v)
+                    for k, v in vars(data).items()
+                    if not k.startswith("__")
+                }
+            except TypeError:
+                return str(data)
+
+        # 7. Fallback for unserializable objects
+        else:
+            return f"<Unserializable: {type(data).__name__}>"
+
+    state_dict = {}
+
+    # Types to completely ignore at the top level
+    ignore_types = (torch.nn.Module, torch.device, type(os), type(np), type(torch))
+
+    for name, value in local_vars.items():
+        if name.startswith("__"):
+            continue
+        if isinstance(value, ignore_types):
+            continue
+        if callable(value):
+            continue  # Skip functions
+
+        try:
+            cleaned_value = clean_data(value)
+            # numpy.savez handles dicts/lists by pickling them inside the array wrapper.
+            # We wrap it in a 0-d array so we can store mixed types (like a dict) easily.
+            state_dict[name] = np.array(cleaned_value, dtype=object)
+        except Exception as e:
+            if verbose:
+                print(f"Skipping {name}: {e}")
+
+    np.savez_compressed(filename, **state_dict)
+    print(f"✅ State saved to {filename}")
