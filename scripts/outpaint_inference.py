@@ -19,6 +19,7 @@ import os
 import sys
 from datetime import datetime
 
+import monai
 import nibabel as nib
 import nibabel.processing as nibproc
 import numpy as np
@@ -38,7 +39,8 @@ from .diff_model_setting import (
     run_torchrun,
 )
 from .sample import ReconModel
-from .utils import define_instance, dynamic_infer
+from .utils import define_instance, dynamic_infer, binarize_labels
+from .find_masks import find_masks
 
 
 def get_volume_bb(img, min_val):
@@ -124,22 +126,13 @@ def prepare_tensors(args, device, logger):
 
 
 def load_models(args, device, logger):
-    """Loads Autoencoder, UNet, and Scale Factor using repo utilities."""
+    """Loads Autoencoder, UNet, Scale Factor, and optionally ControlNet."""
     autoencoder = define_instance(args, "autoencoder_def").to(device)
-    # Load Autoencoder weights
-    checkpoint_autoencoder = torch.load(
-        args.trained_autoencoder_path, map_location=device
-    )
-    if "unet_state_dict" in checkpoint_autoencoder.keys():
-        checkpoint_autoencoder = checkpoint_autoencoder["unet_state_dict"]
-    autoencoder.load_state_dict(checkpoint_autoencoder)
-    autoencoder.eval()
-    logger.info(f"Checkpoints {args.trained_autoencoder_path} loaded.")
+    # ... (existing autoencoder loading code) ...
 
     # Load UNet weights
     unet = define_instance(args, "diffusion_unet_def").to(device)
     checkpoint = torch.load(
-        # "/home/francois/Projects/NV-Generate-CTMR/models/diff_unet_3d_ddpm-ct.pt",
         args.trained_diffusion_path,
         map_location=device,
         weights_only=False,
@@ -148,10 +141,97 @@ def load_models(args, device, logger):
     unet.eval()
     logger.info(f"Checkpoints {args.trained_diffusion_path} loaded.")
 
+    controlnet = None
+    if hasattr(args, "controlnet_def") and hasattr(args, "trained_controlnet_path"):
+        try:
+            controlnet = define_instance(args, "controlnet_def").to(device)
+            checkpoint_controlnet = torch.load(
+                args.trained_controlnet_path, map_location=device, weights_only=False
+            )
+            monai.networks.utils.copy_model_state(controlnet, unet.state_dict())
+            controlnet.load_state_dict(
+                checkpoint_controlnet["controlnet_state_dict"], strict=False
+            )
+            controlnet.eval()
+            logger.info(f"ControlNet loaded from {args.trained_controlnet_path}.")
+        except Exception as e:
+            logger.warning(f"Could not load ControlNet: {e}")
+
     # Load Scale Factor
     scale_factor = checkpoint.get("scale_factor", 1.0)
     logger.info(f"Scale Factor -> {scale_factor}.")
-    return autoencoder, unet, scale_factor
+
+    return autoencoder, unet, controlnet, scale_factor
+
+
+def prepare_control_mask(args, output_size, spacing, device, logger):
+    """
+    Loads a mask from file OR finds a candidate mask from the database.
+    Resamples/Pads it to match the output_size.
+    Returns: Binarized ControlNet condition tensor.
+    """
+    mask_data = None
+
+    # Option A: Explicit Mask Path
+    if hasattr(args, "mask_path") and args.mask_path:
+        logger.info(f"Loading mask from {args.mask_path}...")
+        nii_mask = nib.load(args.mask_path)
+        mask_data = nii_mask
+
+    # Option B: Find Mask in Database
+    elif hasattr(args, "find_mask") and args.find_mask:
+        logger.info("Searching for a suitable mask in database...")
+        # Use find_masks from scripts.find_masks
+        # We need to map config args to find_masks expectations
+        candidates = find_masks(
+            body_region=args.diffusion_unet_inference.get("body_region", ["thorax"]),
+            anatomy_list=args.diffusion_unet_inference.get("anatomy_list", []),
+            spacing=spacing,
+            output_size=output_size,
+            check_spacing_and_output_size=False,  # Allow loose matching to resize later
+            json_file=args.all_mask_files_json,
+            data_root=args.all_mask_files_base_dir,
+        )
+        if not candidates:
+            logger.warning("No candidate mask found. Proceeding without ControlNet.")
+            return None
+
+        # Pick the first one (arbitrary)
+        selected = candidates[0]
+        logger.info(f"Selected mask: {selected['mask_file']}")
+        nii_mask = nib.load(selected["mask_file"])
+        mask_data = nii_mask
+
+    if mask_data is None:
+        return None
+
+    # Resample Mask to Target Spacing/Size
+    target_affine = np.eye(4)
+    for i in range(3):
+        target_affine[i, i] = spacing[i]
+
+    # Resample to specific grid (output_size)
+    dummy_data = np.zeros(output_size)
+    target_img = nib.Nifti1Image(dummy_data, target_affine)
+
+    resampled_mask = nibproc.resample_from_to(
+        mask_data,
+        target_img,
+        order=0,
+        mode="constant",
+        cval=0,
+    )
+
+    mask_np = resampled_mask.get_fdata()
+
+    # Convert to Tensor for ControlNet (Batch, Channel, X, Y, Z)
+    mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
+
+    # Binarize (using utils.binarize_labels)
+    # This assumes the mask contains integer labels (1-132)
+    controlnet_cond = binarize_labels(mask_tensor.long()).half()
+
+    return controlnet_cond
 
 
 def get_repaint_schedule(timesteps, jump_len=10, jump_n_sample=10):
@@ -213,6 +293,8 @@ def run_outpainting(
     input_mask,
     output_size,
     logger,
+    controlnet=None,
+    controlnet_cond=None,
 ):
     """
     Executes the MAISI v2 Rectified Flow Outpainting loop with RePaint support.
@@ -293,6 +375,11 @@ def run_outpainting(
     include_body = unet.include_top_region_index_input
     include_modality = unet.num_class_embeds is not None
 
+    if controlnet is not None and controlnet_cond is not None:
+        logger.info("ControlNet is enabled for inference.")
+        # Ensure cond is on device
+        controlnet_cond = controlnet_cond.to(device)
+
     logger.info(f"Starting Inference with {len(repaint_timesteps) - 1} transitions...")
 
     with torch.no_grad():
@@ -306,7 +393,7 @@ def run_outpainting(
                 # Detect Direction
                 is_denoising = next_t_val < t_val
 
-                # A. Prepare UNet Inputs
+                # A. Prepare UNet + ControlNet Inputs
                 unet_inputs = {
                     "x": latents,
                     "timesteps": t_tensor,
@@ -321,6 +408,26 @@ def run_outpainting(
                     )
                 if include_modality:
                     unet_inputs.update({"class_labels": modality_tensor})
+
+                if controlnet is not None and controlnet_cond is not None:
+                    controlnet_inputs = {
+                        "x": latents,
+                        "timesteps": t_tensor,
+                        "controlnet_cond": controlnet_cond,
+                    }
+                    if include_modality:
+                        controlnet_inputs["class_labels"] = modality_tensor
+
+                    # Run ControlNet
+                    down_block_res_samples, mid_block_res_sample = controlnet(
+                        **controlnet_inputs
+                    )
+                    unet_inputs.update(
+                        {
+                            "down_block_additional_residuals": down_block_res_samples,
+                            "mid_block_additional_residual": mid_block_res_sample,
+                        }
+                    )
 
                 # B. Predict Velocity
                 if cfg_scale > 0:
@@ -423,6 +530,19 @@ def main():
         "--out_index", type=str, default=None, help="Internal use for torchrun"
     )
 
+    # Controlnet args
+    parser.add_argument(
+        "--mask_path",
+        type=str,
+        default=None,
+        help="Path to a specific mask file to use.",
+    )
+    parser.add_argument(
+        "--find_mask",
+        action="store_true",
+        help="If set, searches database for a mask matching anatomy_list.",
+    )
+
     args = parser.parse_args()
 
     # Automatically switch to torchrun if using multiple GPUs and not yet distributed
@@ -465,9 +585,16 @@ def main():
         else tuple(config.diffusion_unet_inference["output_size"])
     )
 
-    autoencoder, unet, scale_factor = load_models(config, device, logger)
+    autoencoder, unet, controlnet, scale_factor = load_models(config, device, logger)
     # IMPORTANT: this function parses the body_region list from the config (e.g., ["thorax"]) and maps it to indices
     cond_tensors = prepare_tensors(config, device, logger)
+    controlnet_cond = None
+    if controlnet is not None:
+        # Determine spacing explicitly if needed, or use the config spacing
+        spacing_val = config.diffusion_unet_inference["spacing"]
+        controlnet_cond = prepare_control_mask(
+            args, output_size, spacing_val, device, logger
+        )
 
     logger.info(f"Loading input crop from {args.input_crop}...")
     nii_img = nib.load(args.input_crop)
@@ -527,6 +654,8 @@ def main():
         input_mask,
         output_size,
         logger,
+        controlnet=controlnet,
+        controlnet_cond=controlnet_cond
     )
 
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
