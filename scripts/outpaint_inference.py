@@ -453,18 +453,35 @@ def run_outpainting(
                 else:
                     v_pred = unet(**unet_inputs)
 
-                # C. Step (Euler step via Scheduler)
-                # RFlow: latents_next = latents + (next_t - t) * v_pred
-                latents_next, _ = noise_scheduler.step(v_pred, t_val, latents, next_t_val)
+                # C. Step (Bidirectional)
+                # noise_scheduler.step handles both forward (dt > 0) and backward (dt < 0)
+                # based on the passed timesteps.
+                # RFlow: latents_next = latents + v_pred * (next_t - t) / T
+                if not isinstance(noise_scheduler, RFlowScheduler):
+                    latents, _ = noise_scheduler.step(v_pred, t_val, latents)  # type: ignore
+                else:
+                    latents, _ = noise_scheduler.step(
+                        v_pred, t_val, latents, next_t_val
+                    )  # type: ignore
 
-                # D. Replacement (The Outpainting Magic)
-                # Calculate where the "known" heart should be at time `next_t`
-                # Trajectory: z_t = t * noise + (1-t) * data
+                # D. Force Known Region (Harmonization)
+                # We enforce the known region conditions.
+                # RePaint suggests doing this during the reverse (denoise) steps
+                # to correct the generated content[cite: 160].
+
+                # Calculate the analytical state of the 'known' region at 'next_t_val'
                 alpha = next_t_val / max_timestep
                 z_known_next = alpha * noise_canvas + (1.0 - alpha) * z0
 
-                # Combine: Keep generated (mask=1) parts, Force known (mask=0) parts
-                latents = latents_next * mask + z_known_next * (1.0 - mask)
+                # Apply mask: Keep generated (mask=1) parts, Force known (mask=0) parts
+                # We apply this primarily when Denoising (moving towards data).
+                # When Diffusing (moving towards noise), we allow the regions to mix
+                # so the subsequent Denoise step can harmonize the boundary.
+
+                if is_denoising:
+                    latents = latents * mask + z_known_next * (1.0 - mask)
+                else:
+                    pass
 
     # 7. Decode
     logger.info("Decoding final volume...")
