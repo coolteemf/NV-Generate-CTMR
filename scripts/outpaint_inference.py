@@ -17,7 +17,6 @@ import argparse
 import logging
 import os
 import sys
-import random
 from datetime import datetime
 
 import nibabel as nib
@@ -27,10 +26,10 @@ import torch
 import torch.distributed as dist
 from monai.inferers import SlidingWindowInferer
 from monai.networks.schedulers import RFlowScheduler
-from monai.utils import set_determinism
 from tqdm import tqdm
 
-# Import utilities from the existing repo structure
+from scripts.diff_model_infer import save_image, set_random_seed
+
 # Note: These require running as a module (python -m scripts.outpaint_inference)
 from .diff_model_setting import (
     initialize_distributed,
@@ -40,10 +39,6 @@ from .diff_model_setting import (
 )
 from .sample import ReconModel
 from .utils import define_instance, dynamic_infer
-
-# -------------------------------------------------------------------------
-# Reuse Helper Functions
-# -------------------------------------------------------------------------
 
 
 def get_volume_bb(img, min_val):
@@ -65,44 +60,7 @@ def get_volume_bb(img, min_val):
     return x_start, x_end, y_start, y_end, z_start, z_end
 
 
-def set_random_seed(seed: int) -> int:
-    random_seed = random.randint(0, 99999) if seed is None else seed
-    set_determinism(random_seed)
-    return random_seed
-
-
-def load_models(args, device, logger):
-    """Loads Autoencoder, UNet, and Scale Factor using repo utilities."""
-    autoencoder = define_instance(args, "autoencoder_def").to(device)
-    # Load Autoencoder weights
-    checkpoint_autoencoder = torch.load(
-        args.trained_autoencoder_path, map_location=device
-    )
-    if "unet_state_dict" in checkpoint_autoencoder.keys():
-        checkpoint_autoencoder = checkpoint_autoencoder["unet_state_dict"]
-    autoencoder.load_state_dict(checkpoint_autoencoder)
-    autoencoder.eval()
-    logger.info(f"Checkpoints {args.trained_autoencoder_path} loaded.")
-
-    # Load UNet weights
-    unet = define_instance(args, "diffusion_unet_def").to(device)
-    checkpoint = torch.load(
-        # "/home/francois/Projects/NV-Generate-CTMR/models/diff_unet_3d_ddpm-ct.pt",
-        args.trained_diffusion_path,
-        map_location=device,
-        weights_only=False,
-    )
-    unet.load_state_dict(checkpoint["unet_state_dict"], strict=False)
-    unet.eval()
-    logger.info(f"Checkpoints {args.trained_diffusion_path} loaded.")
-
-    # Load Scale Factor
-    scale_factor = checkpoint.get("scale_factor", 1.0)
-    logger.info(f"Scale Factor -> {scale_factor}.")
-    return autoencoder, unet, scale_factor
-
-
-def prepare_tensors(args, device):
+def prepare_tensors(args, device, logger):
     """Prepares conditioning tensors (spacing, body regions) from config."""
     # Robustly get the inference config dict
     if hasattr(args, "diffusion_unet_inference"):
@@ -160,23 +118,40 @@ def prepare_tensors(args, device):
         device
     )
 
+    logger.info(f"Top Region: {top_region}, Bottom Region: {bottom_region}")
+
     return top_tensor, bot_tensor, sp_tensor, mod_tensor
 
 
-def save_image(data, output_spacing, output_path, logger):
-    out_affine = np.eye(4)
-    for i in range(3):
-        out_affine[i, i] = output_spacing[i]
+def load_models(args, device, logger):
+    """Loads Autoencoder, UNet, and Scale Factor using repo utilities."""
+    autoencoder = define_instance(args, "autoencoder_def").to(device)
+    # Load Autoencoder weights
+    checkpoint_autoencoder = torch.load(
+        args.trained_autoencoder_path, map_location=device
+    )
+    if "unet_state_dict" in checkpoint_autoencoder.keys():
+        checkpoint_autoencoder = checkpoint_autoencoder["unet_state_dict"]
+    autoencoder.load_state_dict(checkpoint_autoencoder)
+    autoencoder.eval()
+    logger.info(f"Checkpoints {args.trained_autoencoder_path} loaded.")
 
-    new_image = nib.Nifti1Image(data, affine=out_affine)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    nib.save(new_image, output_path)
-    logger.info(f"Saved {output_path}.")
+    # Load UNet weights
+    unet = define_instance(args, "diffusion_unet_def").to(device)
+    checkpoint = torch.load(
+        # "/home/francois/Projects/NV-Generate-CTMR/models/diff_unet_3d_ddpm-ct.pt",
+        args.trained_diffusion_path,
+        map_location=device,
+        weights_only=False,
+    )
+    unet.load_state_dict(checkpoint["unet_state_dict"], strict=False)
+    unet.eval()
+    logger.info(f"Checkpoints {args.trained_diffusion_path} loaded.")
 
-
-# -------------------------------------------------------------------------
-# Core Outpainting Logic (RePaint Enhanced)
-# -------------------------------------------------------------------------
+    # Load Scale Factor
+    scale_factor = checkpoint.get("scale_factor", 1.0)
+    logger.info(f"Scale Factor -> {scale_factor}.")
+    return autoencoder, unet, scale_factor
 
 
 def get_repaint_schedule(timesteps, jump_len=10, jump_n_sample=10):
@@ -491,7 +466,8 @@ def main():
     )
 
     autoencoder, unet, scale_factor = load_models(config, device, logger)
-    cond_tensors = prepare_tensors(config, device)
+    # IMPORTANT: this function parses the body_region list from the config (e.g., ["thorax"]) and maps it to indices
+    cond_tensors = prepare_tensors(config, device, logger)
 
     logger.info(f"Loading input crop from {args.input_crop}...")
     nii_img = nib.load(args.input_crop)
@@ -557,7 +533,7 @@ def main():
     out_name = f"{args.output_prefix}_{timestamp}.nii.gz"
     out_path = os.path.join(args.output_dir, out_name)
 
-    save_image(result_data, output_spacing, out_path, logger)
+    save_image(result_data, output_size, output_spacing, out_path, logger)
 
     if dist.is_initialized():
         dist.destroy_process_group()
