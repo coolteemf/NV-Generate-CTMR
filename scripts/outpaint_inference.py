@@ -335,8 +335,6 @@ def run_outpainting(
         size=latent_shape[-3:],
         mode="nearest",
     )
-    # TODO REMOVE THIS
-    mask = torch.ones_like(mask)
 
 
     # 4. Initialize Noise
