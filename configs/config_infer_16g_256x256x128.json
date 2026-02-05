@@ -3,7 +3,7 @@
     "body_region": ["thorax", "abdomen", "pelvis"],
     "anatomy_list": [],
     "controllable_anatomy_size": [],
-    "num_inference_steps": 30,
+    "num_inference_steps": 1000,
     "mask_generation_num_inference_steps": 1000,
     "output_size": [
         256,
