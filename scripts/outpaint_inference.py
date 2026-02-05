@@ -39,7 +39,7 @@ from .diff_model_setting import (
     run_torchrun,
 )
 from .sample import ReconModel
-from .utils import define_instance, dynamic_infer, binarize_labels
+from .utils import define_instance, dynamic_infer, binarize_labels, plot_volume_grid
 from .find_masks import find_masks
 
 
@@ -468,8 +468,20 @@ def run_outpainting(
                 # to correct the generated content[cite: 160].
 
                 # Calculate the analytical state of the 'known' region at 'next_t_val'
-                alpha = next_t_val / max_timestep
-                z_known_next = alpha * noise_canvas + (1.0 - alpha) * z0
+                if not isinstance(noise_scheduler, RFlowScheduler):
+                    # DDPM (RePaint) Logic
+                    # RePaint samples the known region using the DDPM forward process properties.
+                    # Formula: x_t = sqrt(alpha_cumprod) * x0 + sqrt(1 - alpha_cumprod) * epsilon.
+                    
+                    # Retrieve alpha_cumprod (bar_alpha) for the specific timestep
+                    alpha_prod_t = noise_scheduler.alphas_cumprod[next_t_val]
+                    
+                    z_known_next = (alpha_prod_t ** 0.5) * z0 + ((1 - alpha_prod_t) ** 0.5) * noise_canvas
+
+                else:
+                    # Rectified Flow Logic
+                    alpha = next_t_val / max_timestep
+                    z_known_next = alpha * noise_canvas + (1.0 - alpha) * z0
 
                 # Apply mask: Keep generated (mask=1) parts, Force known (mask=0) parts
                 # We apply this primarily when Denoising (moving towards data).
@@ -505,6 +517,7 @@ def run_outpainting(
             synthetic_images = dynamic_infer(inferer, recon_model, latents)
 
     data = synthetic_images.squeeze().cpu().detach().numpy()
+    plot_volume_grid(data, 16)
     a_min, a_max = -1000, 1000
     data = data * (a_max - a_min) + a_min
     data = np.clip(data, a_min, a_max)
