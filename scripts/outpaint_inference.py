@@ -128,8 +128,15 @@ def prepare_tensors(args, device, logger):
 def load_models(args, device, logger):
     """Loads Autoencoder, UNet, Scale Factor, and optionally ControlNet."""
     autoencoder = define_instance(args, "autoencoder_def").to(device)
-    # ... (existing autoencoder loading code) ...
-
+    checkpoint_autoencoder = torch.load(
+        args.trained_autoencoder_path, map_location=device
+    )
+    if "unet_state_dict" in checkpoint_autoencoder.keys():
+        checkpoint_autoencoder = checkpoint_autoencoder["unet_state_dict"]
+    autoencoder.load_state_dict(checkpoint_autoencoder)
+    autoencoder.eval()
+    logger.info(f"Checkpoints {args.trained_autoencoder_path} loaded.")
+    
     # Load UNet weights
     unet = define_instance(args, "diffusion_unet_def").to(device)
     checkpoint = torch.load(
