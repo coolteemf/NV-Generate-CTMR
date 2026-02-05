@@ -136,7 +136,7 @@ def load_models(args, device, logger):
     autoencoder.load_state_dict(checkpoint_autoencoder)
     autoencoder.eval()
     logger.info(f"Checkpoints {args.trained_autoencoder_path} loaded.")
-    
+
     # Load UNet weights
     unet = define_instance(args, "diffusion_unet_def").to(device)
     checkpoint = torch.load(
@@ -171,7 +171,7 @@ def load_models(args, device, logger):
     return autoencoder, unet, controlnet, scale_factor
 
 
-def prepare_control_mask(args, output_size, spacing, device, logger):
+def prepare_control_mask(config, output_size, spacing, device, logger):
     """
     Loads a mask from file OR finds a candidate mask from the database.
     Resamples/Pads it to match the output_size.
@@ -180,24 +180,24 @@ def prepare_control_mask(args, output_size, spacing, device, logger):
     mask_data = None
 
     # Option A: Explicit Mask Path
-    if hasattr(args, "mask_path") and args.mask_path:
-        logger.info(f"Loading mask from {args.mask_path}...")
-        nii_mask = nib.load(args.mask_path)
+    if hasattr(config, "mask_path") and config.mask_path:
+        logger.info(f"Loading mask from {config.mask_path}...")
+        nii_mask = nib.load(config.mask_path)
         mask_data = nii_mask
 
     # Option B: Find Mask in Database
-    elif hasattr(args, "find_mask") and args.find_mask:
+    elif hasattr(config, "find_mask") and config.find_mask:
         logger.info("Searching for a suitable mask in database...")
         # Use find_masks from scripts.find_masks
         # We need to map config args to find_masks expectations
         candidates = find_masks(
-            body_region=args.diffusion_unet_inference.get("body_region", ["thorax"]),
-            anatomy_list=args.diffusion_unet_inference.get("anatomy_list", []),
+            body_region=config.diffusion_unet_inference.get("body_region", ["thorax"]),
+            anatomy_list=config.diffusion_unet_inference.get("anatomy_list", []),
             spacing=spacing,
             output_size=output_size,
             check_spacing_and_output_size=False,  # Allow loose matching to resize later
-            json_file=args.all_mask_files_json,
-            data_root=args.all_mask_files_base_dir,
+            json_file=config.all_mask_files_json,
+            data_root=config.all_mask_files_base_dir,
         )
         if not candidates:
             logger.warning("No candidate mask found. Proceeding without ControlNet.")
@@ -586,7 +586,7 @@ def main():
         # Determine spacing explicitly if needed, or use the config spacing
         spacing_val = config.diffusion_unet_inference["spacing"]
         controlnet_cond = prepare_control_mask(
-            args, output_size, spacing_val, device, logger
+            config, output_size, spacing_val, device, logger
         )
 
     logger.info(f"Loading input crop from {args.input_crop}...")
