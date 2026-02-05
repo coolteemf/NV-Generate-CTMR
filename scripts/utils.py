@@ -31,6 +31,7 @@ from monai.transforms.utils_morphological_ops import dilate, erode
 from monai.utils import TransformBackends, convert_data_type, convert_to_dst_type, get_equivalent_dtype
 from scipy import stats
 from torch import Tensor
+import matplotlib.pyplot as plt
 
 
 def remap_labels(mask, label_dict_remap_json):
@@ -804,3 +805,50 @@ def save_debug_state(local_vars, filename="debug_state.npz", verbose=True):
 
     np.savez_compressed(filename, **state_dict)
     print(f"✅ State saved to {filename}")
+
+
+def plot_volume_grid(data, num_slices, cmap="gray"):
+    """
+    Plots a 3D volume in a 2D grid of slices.
+
+    Parameters:
+    - data: 3D numpy array (Depth, Height, Width) or (Height, Width, Depth).
+            The function slices along the last axis.
+    - num_slices: Integer, the number of slices to display (resolution).
+    - cmap: String, the colormap to use (default is 'gray').
+    """
+
+    # Determine the depth (size of the last axis)
+    depth = data.shape[-1]
+
+    # 1. Calculate indices for slices evenly spaced throughout the volume
+    slice_indices = np.linspace(0, depth - 1, num_slices, dtype=int)
+
+    # 2. Determine grid size (rows and cols) to make it as square as possible
+    cols = int(np.ceil(np.sqrt(num_slices)))
+    rows = int(np.ceil(num_slices / cols))
+
+    # 3. Create the figure and subplots
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2, rows * 2))
+
+    # Ensure axes is always a flat array for easy iteration,
+    # even if there is only 1 row or 1 column.
+    axes = np.array(axes).flatten()
+
+    # 4. Plot each slice
+    for i, idx in enumerate(slice_indices):
+        # Extract the 2D slice (slicing along the last axis based on your snippet)
+        # Note: If your data is (D, H, W), you might want data[idx] instead.
+        # This assumes (..., D) structure based on your provided snippet.
+        slice_img = data[..., idx]
+
+        axes[i].imshow(slice_img, cmap=cmap)
+        axes[i].set_title(f"Slice {idx}")
+        axes[i].axis("off")  # Hide axis ticks
+
+    # 5. Turn off any empty subplots (if num_slices doesn't fill the grid perfectly)
+    for i in range(num_slices, len(axes)):
+        axes[i].axis("off")
+
+    plt.tight_layout()
+    plt.show()
