@@ -619,38 +619,55 @@ def main():
 
     logger.info(f"Loading input crop from {args.input_crop}...")
     nii_img = nib.load(args.input_crop)
+
+    # --- Start: Crop input to match target physical FOV ---
+    target_shape = np.array(config.diffusion_unet_inference["output_size"])
+    target_spacing = np.array(config.diffusion_unet_inference["spacing"])
+
+    # Calculate the physical dimensions (FOV) of the target output
+    target_fov_mm = target_shape * target_spacing
+    
+    # Calculate how many voxels in the INPUT image cover that physical distance
+    input_spacing = np.array(nii_img.header.get_zooms())
+    crop_size_voxels = np.round(target_fov_mm / input_spacing).astype(int)
+    
+    # Calculate center crop indices
+    current_shape = np.array(nii_img.shape)
+    start_indices = np.maximum(0, (current_shape - crop_size_voxels) // 2)
+    end_indices = np.minimum(current_shape, start_indices + crop_size_voxels)
+
+    # Perform the crop
+    slices = tuple(slice(s, e) for s, e in zip(start_indices, end_indices))
+    cropped_data = nii_img.get_fdata()[slices]
+
+    # Update the affine matrix: shift the origin to match the new top-left corner
+    new_origin_affine = nii_img.affine.copy()
+    new_origin_affine[:3, 3] += np.dot(new_origin_affine[:3, :3], start_indices)
+
+    # Replace nii_img with the cropped version
+    nii_img = nib.Nifti1Image(cropped_data, new_origin_affine, nii_img.header)
+    logger.info(f"Cropped input volume to {nii_img.shape} to match target configuration spacing.")
+    # --- End: Crop input ---
+
     min_image = nii_img.get_fdata().min()
 
-    target_shape = np.array(config.diffusion_unet_inference["output_size"])
+    # Recalculate zoom factors based on the cropped shape
+    # Since the crop aligns the physical FOVs, this zoom will result in the correct target spacing
     zoom_factors = np.array(nii_img.shape) / target_shape
     new_affine = nii_img.affine @ np.diag(list(zoom_factors) + [1])
-
-    logger.info(f"Resampling from {nii_img.shape} to fixed shape {target_shape}")
 
     nii_img = nibproc.resample_from_to(
         nii_img, (target_shape, new_affine), order=3, mode="constant", cval=min_image
     )
 
     output_spacing = tuple(nib.affines.voxel_sizes(new_affine))
+    logger.info(
+        f"Resampled from {nii_img.shape} to fixed shape {target_shape}. Image spacing: {nii_img.header.get_zooms()}, expected output spacing: {target_spacing}"
+    )
 
-    pad_amount = np.array(output_size) - np.array(nii_img.shape)
-    inferior_padding = pad_amount // 2
+    input_ct = torch.from_numpy(nii_img.get_fdata()).float()
 
-    origin_delta = nii_img.affine[:3, :3] @ inferior_padding
-    new_origin = nii_img.affine[:3, 3] - origin_delta
-    new_affine = np.eye(4)
-    new_affine[:3, :3] = nii_img.affine[:3, :3]
-    new_affine[:3, 3] = new_origin
-    padded_img_data = np.zeros(output_size) + min_image
-    padded_img_data[
-        inferior_padding[0] : inferior_padding[0] + nii_img.shape[0],
-        inferior_padding[1] : inferior_padding[1] + nii_img.shape[1],
-        inferior_padding[2] : inferior_padding[2] + nii_img.shape[2],
-    ] = nii_img.get_fdata()
-    padded_img = nib.nifti1.Nifti1Image(padded_img_data, new_affine)
-    input_ct_crop = torch.from_numpy(padded_img.get_fdata()).float()
-
-    data_bb = get_volume_bb(padded_img_data, -1000)
+    data_bb = get_volume_bb(nii_img, -1000)
     input_mask = np.ones(output_size)
     input_mask[
         data_bb[0] : data_bb[1],
@@ -660,8 +677,8 @@ def main():
     input_mask = torch.from_numpy(input_mask).float()
 
     input_mask = input_mask.unsqueeze(0).unsqueeze(0)
-    input_ct_crop = input_ct_crop.unsqueeze(0).unsqueeze(0)
-    input_ct_crop = input_ct_crop.to(device)
+    input_ct = input_ct.unsqueeze(0).unsqueeze(0)
+    input_ct = input_ct.to(device)
     input_mask = input_mask.to(device)
 
     result_data = run_outpainting(
@@ -671,7 +688,7 @@ def main():
         unet,
         scale_factor,
         cond_tensors,
-        input_ct_crop,
+        input_ct,
         input_mask,
         output_size,
         logger,
