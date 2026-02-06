@@ -18,6 +18,7 @@ from argparse import Namespace
 from datetime import timedelta
 from typing import Any, Sequence
 
+import nibabel as nib
 import numpy as np
 import skimage
 import torch
@@ -852,3 +853,7 @@ def plot_volume_grid(data, num_slices, cmap="gray"):
 
     plt.tight_layout()
     plt.show()
+
+
+def make_nib_vol(data, ref_vol):
+    return nib.Nifti1Image(data, ref_vol.affine, ref_vol.header)
