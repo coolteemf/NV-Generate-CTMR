@@ -43,6 +43,85 @@ from .utils import define_instance, dynamic_infer, binarize_labels, plot_volume_
 from .find_masks import find_masks
 
 
+def resample_volume(nii_img, target_shape, target_spacing, nii_mask=None, logger=None):
+    """
+    Crops input volume (and optional mask) to match the physical FOV of the
+    target configuration, then resamples to the target grid size.
+
+    Args:
+        nii_img: nibabel Nifti1Image (Input Volume)
+        target_shape: tuple/list of ints (e.g. [512, 512, 128])
+        target_spacing: tuple/list of floats (e.g. [0.75, 0.75, 4.0])
+        nii_mask: (Optional) nibabel Nifti1Image (Control Mask)
+    """
+    if logger:
+        logger.info(f"Target Config - Shape: {target_shape}, Spacing: {target_spacing}")
+
+    # 1. Calculate target FOV in mm
+    target_fov_mm = np.array(target_shape) * np.array(target_spacing)
+
+    # 2. Calculate crop size in Input Voxels
+    input_spacing = np.array(nii_img.header.get_zooms())
+    crop_size_voxels = np.round(target_fov_mm / input_spacing).astype(int)
+
+    # 3. Calculate Center Crop Indices
+    current_shape = np.array(nii_img.shape)
+    start_indices = np.maximum(0, (current_shape - crop_size_voxels) // 2)
+    end_indices = np.minimum(current_shape, start_indices + crop_size_voxels)
+
+    slices = tuple(slice(s, e) for s, e in zip(start_indices, end_indices))
+
+    # 4. Perform Crop (Volume)
+    cropped_data = nii_img.get_fdata()[slices]
+
+    # Update Affine (Shift Origin)
+    new_origin_affine = nii_img.affine.copy()
+    new_origin_affine[:3, 3] += np.dot(new_origin_affine[:3, :3], start_indices)
+
+    nii_crop = nib.Nifti1Image(cropped_data, new_origin_affine, nii_img.header)
+
+    if logger:
+        logger.info(f"Cropped volume to {nii_crop.shape} to match physical FOV.")
+
+    # 5. Perform Crop (Mask) - MUST use same indices
+    nii_mask_crop = None
+    if nii_mask is not None:
+        # Check alignment (basic check)
+        if not np.allclose(nii_mask.affine, nii_img.affine):
+            if logger:
+                logger.warning(
+                    "Mask affine differs from Volume affine. Cropping might be misaligned."
+                )
+
+        mask_data_crop = nii_mask.get_fdata()[slices]
+        nii_mask_crop = nib.Nifti1Image(
+            mask_data_crop, new_origin_affine, nii_mask.header
+        )
+
+    # 6. Resample to Target Grid
+    # Calculate affine that scales the *cropped* FOV to the *target* matrix size
+    zoom_factors = np.array(nii_crop.shape) / np.array(target_shape)
+    target_affine = nii_crop.affine @ np.diag(list(zoom_factors) + [1])
+
+    # Resample Volume (Order 3: Cubic)
+    min_val = nii_crop.get_fdata().min()
+    resampled_vol = nibproc.resample_from_to(
+        nii_crop, (target_shape, target_affine), order=3, mode="constant", cval=min_val
+    )
+
+    # Resample Mask (Order 0: Nearest Neighbor)
+    resampled_mask = None
+    if nii_mask_crop is not None:
+        resampled_mask = nibproc.resample_from_to(
+            nii_mask_crop,
+            (target_shape, target_affine),
+            order=0,
+            mode="constant",
+            cval=0,
+        )
+
+    return resampled_vol, resampled_mask
+
 def get_volume_bb(img, min_val):
     mask = img > min_val
 
@@ -336,6 +415,10 @@ def run_outpainting(
         mode="nearest",
     )
 
+    # #TODO remove
+    # mask = torch.ones_like(mask)
+    # infer_conf["jump_length"] = 3
+    # infer_conf["jump_n_sample"] = 3
 
     # 4. Initialize Noise
     noise_canvas = torch.randn(latent_shape, device=device)
@@ -579,6 +662,8 @@ def main():
 
     config.output_dir = args.output_dir
     config.output_prefix = args.output_prefix
+    config.mask_path = args.mask_path
+    config.find_mask = args.find_mask
 
     local_rank, world_size, device = initialize_distributed(args.num_gpus)
     logger = setup_logging("outpaint_inference")
@@ -609,77 +694,66 @@ def main():
     autoencoder, unet, controlnet, scale_factor = load_models(config, device, logger)
     # IMPORTANT: this function parses the body_region list from the config (e.g., ["thorax"]) and maps it to indices
     cond_tensors = prepare_tensors(config, device, logger)
-    controlnet_cond = None
-    if controlnet is not None:
-        # Determine spacing explicitly if needed, or use the config spacing
-        spacing_val = config.diffusion_unet_inference["spacing"]
-        controlnet_cond = prepare_control_mask(
-            config, output_size, spacing_val, device, logger
-        )
 
+    # Load Input Volume
     logger.info(f"Loading input crop from {args.input_crop}...")
     nii_img = nib.load(args.input_crop)
 
-    # --- Start: Crop input to match target physical FOV ---
-    target_shape = np.array(config.diffusion_unet_inference["output_size"])
-    target_spacing = np.array(config.diffusion_unet_inference["spacing"])
+    # Load Control/Conditioning Mask
+    nii_mask_raw = None
+    if controlnet is not None:
+        if config.mask_path:
+            logger.info(f"Loading mask from {config.mask_path}...")
+            nii_mask_raw = nib.load(config.mask_path)
+        elif config.find_mask:
+            candidates = find_masks(
+                body_region=config.diffusion_unet_inference.get(
+                    "body_region", ["thorax"]
+                ),
+                anatomy_list=config.diffusion_unet_inference.get("anatomy_list", []),
+                spacing=config.diffusion_unet_inference["spacing"],
+                output_size=output_size,
+                check_spacing_and_output_size=False,
+                json_file=config.all_mask_files_json,
+                data_root=config.all_mask_files_base_dir,
+            )
+            if candidates:
+                logger.info(f"Selected mask: {candidates[0]['mask_file']}")
+                nii_mask_raw = nib.load(candidates[0]["mask_file"])
 
-    # Calculate the physical dimensions (FOV) of the target output
-    target_fov_mm = target_shape * target_spacing
-    
-    # Calculate how many voxels in the INPUT image cover that physical distance
-    input_spacing = np.array(nii_img.header.get_zooms())
-    crop_size_voxels = np.round(target_fov_mm / input_spacing).astype(int)
-    
-    # Calculate center crop indices
-    current_shape = np.array(nii_img.shape)
-    start_indices = np.maximum(0, (current_shape - crop_size_voxels) // 2)
-    end_indices = np.minimum(current_shape, start_indices + crop_size_voxels)
+    target_shape = config.diffusion_unet_inference["output_size"]
+    target_spacing = config.diffusion_unet_inference["spacing"]
 
-    # Perform the crop
-    slices = tuple(slice(s, e) for s, e in zip(start_indices, end_indices))
-    cropped_data = nii_img.get_fdata()[slices]
-
-    # Update the affine matrix: shift the origin to match the new top-left corner
-    new_origin_affine = nii_img.affine.copy()
-    new_origin_affine[:3, 3] += np.dot(new_origin_affine[:3, :3], start_indices)
-
-    # Replace nii_img with the cropped version
-    nii_img = nib.Nifti1Image(cropped_data, new_origin_affine, nii_img.header)
-    logger.info(f"Cropped input volume to {nii_img.shape} to match target configuration spacing.")
-    # --- End: Crop input ---
-
-    min_image = nii_img.get_fdata().min()
-
-    # Recalculate zoom factors based on the cropped shape
-    # Since the crop aligns the physical FOVs, this zoom will result in the correct target spacing
-    zoom_factors = np.array(nii_img.shape) / target_shape
-    new_affine = nii_img.affine @ np.diag(list(zoom_factors) + [1])
-
-    nii_img = nibproc.resample_from_to(
-        nii_img, (target_shape, new_affine), order=3, mode="constant", cval=min_image
+    nii_img_resampled, nii_mask_resampled = resample_volume(
+        nii_img, target_shape, target_spacing, nii_mask=nii_mask_raw, logger=logger
     )
+    output_spacing = tuple(nib.affines.voxel_sizes(nii_img_resampled.affine))
 
-    output_spacing = tuple(nib.affines.voxel_sizes(new_affine))
-    logger.info(
-        f"Resampled from {nii_img.shape} to fixed shape {target_shape}. Image spacing: {nii_img.header.get_zooms()}, expected output spacing: {target_spacing}"
-    )
+    input_ct = torch.from_numpy(nii_img_resampled.get_fdata()).float()
+    input_ct = input_ct.unsqueeze(0).unsqueeze(0).to(device)
 
-    input_ct = torch.from_numpy(nii_img.get_fdata()).float()
-
-    data_bb = get_volume_bb(nii_img, -1000)
-    input_mask = np.ones(output_size)
-    input_mask[
+    # Inpainting Mask
+    data_bb = get_volume_bb(nii_img_resampled.get_fdata(), -1000)
+    inpainting_mask = np.ones(output_size)
+    inpainting_mask[
         data_bb[0] : data_bb[1],
         data_bb[2] : data_bb[3],
         data_bb[4] : data_bb[5],
     ] = 0
-    input_mask = torch.from_numpy(input_mask).float()
+    inpainting_mask = (
+        torch.from_numpy(inpainting_mask).float().unsqueeze(0).unsqueeze(0).to(device)
+    )
+    # Process ControlNet Tensor
+    controlnet_cond = None
+    if nii_mask_resampled is not None:
+        mask_np = nii_mask_resampled.get_fdata()
+        mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
+        controlnet_cond = binarize_labels(mask_tensor.long()).half()
 
-    input_mask = input_mask.unsqueeze(0).unsqueeze(0)
-    input_ct = input_ct.unsqueeze(0).unsqueeze(0)
-    input_ct = input_ct.to(device)
-    input_mask = input_mask.to(device)
+
+    logger.info(
+        f"Resampled from {nii_img.shape} to fixed shape {target_shape}. Image spacing: {nii_img_resampled.header.get_zooms()}, expected output spacing: {target_spacing}"
+    )
 
     result_data = run_outpainting(
         config,
@@ -689,7 +763,7 @@ def main():
         scale_factor,
         cond_tensors,
         input_ct,
-        input_mask,
+        inpainting_mask,
         output_size,
         logger,
         controlnet=controlnet,
