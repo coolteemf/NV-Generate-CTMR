@@ -26,6 +26,6 @@
     "mask_generation_autoencoder": "$@mask_generation_autoencoder_def",
     "mask_generation_diffusion": "$@mask_generation_diffusion_def",
     "modality": 1,
-    "jump_length": 3,
-    "jump_n_sample": 3
+    "jump_length": 1,
+    "jump_n_sample": 1
 }

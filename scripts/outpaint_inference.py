@@ -29,7 +29,7 @@ from monai.inferers import SlidingWindowInferer
 from monai.networks.schedulers import RFlowScheduler
 from tqdm import tqdm
 
-from scripts.diff_model_infer import save_image, set_random_seed
+from scripts.diff_model_infer import set_random_seed
 
 # Note: These require running as a module (python -m scripts.outpaint_inference)
 from .diff_model_setting import (
@@ -41,6 +41,29 @@ from .diff_model_setting import (
 from .sample import ReconModel
 from .utils import define_instance, dynamic_infer, binarize_labels, plot_volume_grid
 from .find_masks import find_masks
+
+
+def save_image(
+    data: np.ndarray,
+    out_affine: tuple,
+    output_path: str,
+    logger: logging.Logger,
+) -> None:
+    """
+    Save the generated synthetic image to a file.
+
+    Args:
+        data (np.ndarray): Synthetic image data.
+        output_size (tuple): Output size of the image.
+        out_spacing (tuple): Spacing of the output image.
+        output_path (str): Path to save the output image.
+        logger (logging.Logger): Logger for logging information.
+    """
+
+    new_image = nib.Nifti1Image(data, affine=out_affine)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    nib.save(new_image, output_path)
+    logger.info(f"Saved {output_path}.")
 
 
 def resample_volume(nii_img, target_shape, target_spacing, nii_mask=None, logger=None):
@@ -416,9 +439,7 @@ def run_outpainting(
     )
 
     # #TODO remove
-    # mask = torch.ones_like(mask)
-    # infer_conf["jump_length"] = 3
-    # infer_conf["jump_n_sample"] = 3
+    mask = torch.ones_like(mask)
 
     # 4. Initialize Noise
     noise_canvas = torch.randn(latent_shape, device=device)
@@ -774,7 +795,12 @@ def main():
     out_name = f"{args.output_prefix}_{timestamp}.nii.gz"
     out_path = os.path.join(args.output_dir, out_name)
 
-    save_image(result_data, output_size, output_spacing, out_path, logger)
+    save_image(
+        result_data,
+        nii_img_resampled.affine,
+        out_path,
+        logger,
+    )
 
     if dist.is_initialized():
         dist.destroy_process_group()

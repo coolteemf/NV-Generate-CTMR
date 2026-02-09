@@ -17,6 +17,8 @@
                 "configs/config_network_rflow.json",
                 "-i",
                 "./heart_aligned.nii.gz",
+                "--mask_path",
+                "combined_labelmap.nii.gz"
             ],
             "env": {
                 "PYTHONPATH": "/home/francois/Projects/NV-Generate-CTMR",
