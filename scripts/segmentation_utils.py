@@ -1,4 +1,7 @@
 # Standard output filenames of TotalSegmentator and label values
+import numpy as np
+
+
 segmentation_names = {
     1: "spleen",
     2: "kidney_right",
@@ -118,3 +121,88 @@ segmentation_names = {
     116: "sternum",
     117: "costal_cartilages",
 }
+
+
+def find_matching_label(filename_stem, label_dict):
+    """
+    Tries to find the integer label in label_dict that corresponds to the
+    filename_stem (e.g. maps 'kidney_right' -> 'right kidney' -> 5).
+    """
+    # 1. Exact match (unlikely given naming conventions)
+    if filename_stem in label_dict:
+        return label_dict[filename_stem]
+
+    # 2. Underscore to space substitution (e.g. 'small_bowel' -> 'small bowel')
+    name_spaced = filename_stem.replace("_", " ")
+    if name_spaced in label_dict:
+        return label_dict[name_spaced]
+
+    # 3. Sorted word matching (e.g. 'kidney_right' -> 'kidney right' == 'right kidney')
+    stem_words = sorted(name_spaced.split())
+    for label_name, label_id in label_dict.items():
+        label_words = sorted(label_name.split())
+        if stem_words == label_words:
+            return label_id
+
+    # 4. Specific manual overrides for known mismatches
+
+    # Urinary System
+    if filename_stem == "urinary_bladder" and "bladder" in label_dict:
+        return label_dict["bladder"]
+
+    # Vascular System (Latin/English inconsistencies)
+    # Maps 'iliac_vein_left' -> 'left iliac vena'
+    if "iliac_vein" in filename_stem:
+        # Swap vein->vena and try again
+        latin_name = filename_stem.replace("iliac_vein", "iliac_vena").replace("_", " ")
+        latin_name_sorted = sorted(latin_name.split())
+        for label_name, label_id in label_dict.items():
+            if sorted(label_name.split()) == latin_name_sorted:
+                return label_id
+
+    # Musculoskeletal (TotalSegmentator v1 vs v2)
+    if filename_stem == "erector_spinae_left" and "left autochthon" in label_dict:
+        return label_dict["left autochthon"]
+    if filename_stem == "erector_spinae_right" and "right autochthon" in label_dict:
+        return label_dict["right autochthon"]
+
+    # Gastrointestinal
+    if filename_stem == "small_intestine" and "small bowel" in label_dict:
+        return label_dict["small bowel"]
+
+    return None
+
+
+def build_translation_table(ts_names, labelmap_maisi):
+    """
+    Builds a numpy lookup table using find_matching_label.
+    """
+    max_ts_id = max(ts_names.keys())
+    # Create array big enough to hold max ID, initialized to 0 (background)
+    translation_map = np.zeros(max_ts_id + 1, dtype=np.uint16)
+
+    mapped_count = 0
+    unmapped = []
+
+    print(f"{'TS ID':<6} | {'TS Name':<30} -> {'MAISI ID'}")
+    print("-" * 55)
+
+    for ts_id, ts_name in ts_names.items():
+        # Call the smart matching function
+        maisi_id = find_matching_label(ts_name, labelmap_maisi)
+
+        if maisi_id is not None:
+            translation_map[ts_id] = maisi_id
+            print(f"{ts_id:<6} | {ts_name:<30} -> {maisi_id}")
+            mapped_count += 1
+        else:
+            unmapped.append(f"{ts_id}: {ts_name}")
+
+    print("-" * 55)
+    print(f"Mapping complete. Mapped {mapped_count} labels.")
+    if unmapped:
+        print(f"Warning: {len(unmapped)} labels could not be mapped (set to 0):")
+        for u in unmapped:
+            print(f"  - {u}")
+
+    return translation_map

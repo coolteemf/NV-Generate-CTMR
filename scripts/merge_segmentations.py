@@ -4,60 +4,10 @@ import nibabel as nib
 import numpy as np
 import json
 
-from scripts.segmentation_utils import segmentation_names
+from scripts.segmentation_utils import find_matching_label, segmentation_names
 from scripts.utils import make_nib_vol
 
 FILES_TO_PROCESS = list(segmentation_names.values())
-
-def find_matching_label(filename_stem, label_dict):
-    """
-    Tries to find the integer label in label_dict that corresponds to the
-    filename_stem (e.g. maps 'kidney_right' -> 'right kidney' -> 5).
-    """
-    # 1. Exact match (unlikely given naming conventions)
-    if filename_stem in label_dict:
-        return label_dict[filename_stem]
-
-    # 2. Underscore to space substitution (e.g. 'small_bowel' -> 'small bowel')
-    name_spaced = filename_stem.replace("_", " ")
-    if name_spaced in label_dict:
-        return label_dict[name_spaced]
-
-    # 3. Sorted word matching (e.g. 'kidney_right' -> 'kidney right' == 'right kidney')
-    stem_words = sorted(name_spaced.split())
-    for label_name, label_id in label_dict.items():
-        label_words = sorted(label_name.split())
-        if stem_words == label_words:
-            return label_id
-
-    # 4. Specific manual overrides for known mismatches
-
-    # Urinary System
-    if filename_stem == "urinary_bladder" and "bladder" in label_dict:
-        return label_dict["bladder"]
-
-    # Vascular System (Latin/English inconsistencies)
-    # Maps 'iliac_vein_left' -> 'left iliac vena'
-    if "iliac_vein" in filename_stem:
-        # Swap vein->vena and try again
-        latin_name = filename_stem.replace("iliac_vein", "iliac_vena").replace("_", " ")
-        latin_name_sorted = sorted(latin_name.split())
-        for label_name, label_id in label_dict.items():
-            if sorted(label_name.split()) == latin_name_sorted:
-                return label_id
-
-    # Musculoskeletal (TotalSegmentator v1 vs v2)
-    if filename_stem == "erector_spinae_left" and "left autochthon" in label_dict:
-        return label_dict["left autochthon"]
-    if filename_stem == "erector_spinae_right" and "right autochthon" in label_dict:
-        return label_dict["right autochthon"]
-
-    # Gastrointestinal
-    if filename_stem == "small_intestine" and "small bowel" in label_dict:
-        return label_dict["small bowel"]
-
-    return None
-
 
 def create_multilabel_volume(pth, file_patterns, label_map):
     """
