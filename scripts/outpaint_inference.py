@@ -429,8 +429,11 @@ def run_outpainting(
     input_norm = torch.clamp(input_norm, 0.0, 1.0).to(device)
 
     with torch.no_grad():
-        with torch.amp.autocast("cuda", enabled=True):
-            z0 = autoencoder.encode_stage_2_inputs(input_norm) * scale_factor
+        if device.type != "cpu":
+            with torch.amp.autocast("cuda", enabled=True):
+                z0 = autoencoder.encode_stage_2_inputs(input_norm) * scale_factor
+        else:
+            z0 = autoencoder.encode_stage_2_inputs(input_norm.to(torch.float32)) * scale_factor
 
     mask = torch.nn.functional.interpolate(
         input_mask,
@@ -495,7 +498,7 @@ def run_outpainting(
     logger.info(f"Starting Inference with {len(repaint_timesteps) - 1} transitions...")
 
     with torch.no_grad():
-        with torch.amp.autocast("cuda", enabled=True):
+        with torch.amp.autocast("cuda", enabled=True if device.type != "cpu" else False):
             for t_val, next_t_val in tqdm(
                 timestep_pairs, total=len(repaint_timesteps) - 1
             ):
@@ -617,7 +620,7 @@ def run_outpainting(
     )
 
     with torch.no_grad():
-        with torch.amp.autocast("cuda", enabled=True):
+        with torch.amp.autocast("cuda", enabled=True if device.type != "cpu" else False):
             synthetic_images = dynamic_infer(inferer, recon_model, latents)
 
     data = synthetic_images.squeeze().cpu().detach().numpy()
@@ -667,11 +670,16 @@ def main():
         action="store_true",
         help="If set, searches database for a mask matching anatomy_list.",
     )
+    parser.add_argument(
+        "--use_cpu",
+        action="store_true",
+        help="Use CPU for inference.",
+    )
 
     args = parser.parse_args()
 
     # Automatically switch to torchrun if using multiple GPUs and not yet distributed
-    if args.num_gpus > 1 and "RANK" not in os.environ:
+    if args.num_gpus > 1 and "RANK" not in os.environ and not args.use_cpu:
         run_torchrun("scripts.outpaint_inference", sys.argv[1:], args.num_gpus)
         return
 
@@ -686,7 +694,13 @@ def main():
     config.mask_path = args.mask_path
     config.find_mask = args.find_mask
 
-    local_rank, world_size, device = initialize_distributed(args.num_gpus)
+    if args.use_cpu:
+        local_rank = 0
+        world_size = 1
+        device = torch.device("cpu")
+    else:
+        local_rank, world_size, device = initialize_distributed(args.num_gpus)
+    
     logger = setup_logging("outpaint_inference")
 
     seed = set_random_seed(
