@@ -652,6 +652,13 @@ def main():
     parser.add_argument("-g", "--num_gpus", type=int, default=1)
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--output_prefix", type=str, default="outpaint_result")
+    parser.add_argument(
+        "-n",
+        "--num_samples",
+        type=int,
+        default=1,
+        help="Number of samples (iterations) to generate with different seeds.",
+    )
 
     # Helper argument to prevent crash when run_torchrun injects --out_index
     parser.add_argument(
@@ -700,14 +707,14 @@ def main():
         device = torch.device("cpu")
     else:
         local_rank, world_size, device = initialize_distributed(args.num_gpus)
-    
+
     logger = setup_logging("outpaint_inference")
 
-    seed = set_random_seed(
-        config.diffusion_unet_inference.get("random_seed", 0) + local_rank
-    )
+    # Identify base seed
+    base_seed = config.diffusion_unet_inference.get("random_seed", 42) + local_rank
+
     logger.info(
-        f"Initialized Rank {local_rank}/{world_size} on {device} with seed {seed}"
+        f"Initialized Rank {local_rank}/{world_size} on {device}. Base seed: {base_seed}"
     )
 
     if "autoencoder_tp_num_splits" in config.diffusion_unet_inference:
@@ -762,7 +769,6 @@ def main():
     nii_img_resampled, nii_mask_resampled = resample_volume(
         nii_img, target_shape, target_spacing, nii_mask=nii_mask_raw, logger=logger
     )
-    output_spacing = tuple(nib.affines.voxel_sizes(nii_img_resampled.affine))
 
     input_ct = torch.from_numpy(nii_img_resampled.get_fdata()).float()
     input_ct = input_ct.unsqueeze(0).unsqueeze(0).to(device)
@@ -778,6 +784,7 @@ def main():
     inpainting_mask = (
         torch.from_numpy(inpainting_mask).float().unsqueeze(0).unsqueeze(0).to(device)
     )
+
     # Process ControlNet Tensor
     controlnet_cond = None
     if nii_mask_resampled is not None:
@@ -785,36 +792,47 @@ def main():
         mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
         controlnet_cond = binarize_labels(mask_tensor.long()).half()
 
-
     logger.info(
-        f"Resampled from {nii_img.shape} to fixed shape {target_shape}. Image spacing: {nii_img_resampled.header.get_zooms()}, expected output spacing: {target_spacing}"
+        f"Resampled from {nii_img.shape} to fixed shape {target_shape}. "
+        f"Image spacing: {nii_img_resampled.header.get_zooms()}, "
+        f"expected output spacing: {target_spacing}"
     )
 
-    result_data = run_outpainting(
-        config,
-        device,
-        autoencoder,
-        unet,
-        scale_factor,
-        cond_tensors,
-        input_ct,
-        inpainting_mask,
-        output_size,
-        logger,
-        controlnet=controlnet,
-        controlnet_cond=controlnet_cond
-    )
+    for i in range(args.num_samples):
+        current_seed = base_seed + i
+        logger.info(
+            f"--- Starting Sample {i + 1} / {args.num_samples} (Seed: {current_seed}) ---"
+        )
 
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    out_name = f"{args.output_prefix}_{timestamp}.nii.gz"
-    out_path = os.path.join(args.output_dir, out_name)
+        # Set seed for this iteration to ensure diverse noise generation
+        set_random_seed(current_seed)
 
-    save_image(
-        result_data,
-        nii_img_resampled.affine,
-        out_path,
-        logger,
-    )
+        result_data = run_outpainting(
+            config,
+            device,
+            autoencoder,
+            unet,
+            scale_factor,
+            cond_tensors,
+            input_ct,
+            inpainting_mask,
+            output_size,
+            logger,
+            controlnet=controlnet,
+            controlnet_cond=controlnet_cond,
+        )
+
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        # Include sample index in filename to distinguish outputs
+        out_name = f"{args.output_prefix}_sample{i:02d}_{timestamp}.nii.gz"
+        out_path = os.path.join(args.output_dir, out_name)
+
+        save_image(
+            result_data,
+            nii_img_resampled.affine,
+            out_path,
+            logger,
+        )
 
     if dist.is_initialized():
         dist.destroy_process_group()
